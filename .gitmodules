@@ -1,0 +1,9 @@
+[submodule "SubModules/GADBench"]
+	path = SubModules/GADBench
+	url = https://github.com/squareRoot3/GADBench
+[submodule "SubModules/ADBench"]
+	path = SubModules/ADBench
+	url = https://github.com/Minqi824/ADBench
+[submodule "SubModules/pygod"]
+	path = SubModules/pygod
+	url = https://github.com/pygod-team/pygod.git
