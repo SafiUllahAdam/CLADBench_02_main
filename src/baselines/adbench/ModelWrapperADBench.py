@@ -7,6 +7,7 @@ import torch
 import tensorflow as tf
 
 from base import Model
+
 from adbench.baseline.PReNet.model import prenet
 from adbench.baseline.PReNet.fit import fit
 from adbench.myutils import Utils
@@ -55,92 +56,136 @@ class PReNetWrapper(Model):
             "s_a_u": 4,
             "s_u_u": 0,
         }
-        self.train_config = {**defaults, **(train_config or {})}
-        self.model_config = model_config or {}
-        self.data = data
-        self._current_epoch = 0
-        self._fitted = False
-        self._pseudo_labels = None  # Will be set by CoLearner during collaborative learning
+        config = {**defaults, **(train_config or {})}
+        super().__init__(train_config=config, model_config=model_config, data=data)
 
         self.utils = Utils()
-        self.device = self.utils.get_device()
+        self.device = self.utils.get_device(gpu_specific=True)  # Enable GPU
         cfg = self.train_config
 
-        X_train = self.data["X_train"]
-        y_train = self.data["y_train"]
-        self.X_train_tensor = torch.from_numpy(X_train).float()
-        self.y_train = y_train
+        self.X_train_tensor = torch.from_numpy(self.X_train).float()
 
         self.utils.set_seed(cfg["seed"])
-        input_size = X_train.shape[1]
+        input_size = self.X_train.shape[1]
         self.model = prenet(input_size=input_size, act_fun=torch.nn.ReLU())
+        self.model = self.model.to(self.device)  # Move model to GPU
         self.optimizer = torch.optim.RMSprop(
             self.model.parameters(),
             lr=cfg["lr"],
             weight_decay=cfg["weight_decay"],
         )
         self.fit_fn = fit
+        
+        # Loss tracking for plotting
+        self._train_loss_history = []
+        self._val_loss_history = []
+        self._last_train_loss = None
+        self._last_val_loss = None
 
     def fit(self) -> None:
-        cfg = self.train_config
-        total_epochs = cfg["total_epochs"]
-
-        for epoch in range(self._current_epoch, total_epochs):
-            self.train(epoch)
+        remaining = self.train_config["total_epochs"] - self._current_epoch
+        if remaining > 0:
+            self.train(remaining)
         self._fitted = True
 
-    def train(self, epoch: int) -> None:
-        """Train for a single epoch with current pseudo-labels."""
-        # Use pseudo-labels from CoLearner if available, otherwise use original labels
-        if self._pseudo_labels is not None:
-            y_pseudo = self._pseudo_labels
-            # Use only samples with valid pseudo-labels (not -1 = unknown)
-            valid_mask = y_pseudo != -1
-            if np.any(valid_mask):
-                y_train = y_pseudo.copy()
-                # For invalid samples, use original labels
-                y_train[~valid_mask] = self.y_train[~valid_mask]
-            else:
-                # No valid pseudo-labels yet, use original
-                y_train = self.y_train
-        else:
-            # Fall back to original labels
-            y_train = self.y_train
-
+    def train(self, epochs: int = 1) -> None:
+        """Train for `epochs` epochs with current pseudo-labels."""
+        y_train = self.y_train.copy()
+        y_train[y_train == -1] = 0
         cfg = self.train_config
 
-        self.fit_fn(
-            X_train_tensor=self.X_train_tensor,
-            y_train=y_train,
-            model=self.model,
-            optimizer=self.optimizer,
-            epochs=1,
-            batch_num=cfg["batch_num"],
-            batch_size=cfg["batch_size"],
-            s_a_a=cfg["s_a_a"],
-            s_a_u=cfg["s_a_u"],
-            s_u_u=cfg["s_u_u"],
-            device=self.device,
-        )
+        for _ in range(epochs):
+            self.fit_fn(
+                X_train_tensor=self.X_train_tensor,
+                y_train=y_train,
+                model=self.model,
+                optimizer=self.optimizer,
+                epochs=1,
+                batch_num=cfg["batch_num"],
+                batch_size=cfg["batch_size"],
+                s_a_a=cfg["s_a_a"],
+                s_a_u=cfg["s_a_u"],
+                s_u_u=cfg["s_u_u"],
+                device=self.device,
+            )
+            self._current_epoch += 1
+            self._fitted = True
 
-        self._current_epoch = epoch + 1
-        self._fitted = True
+            train_loss = self._compute_prenet_loss(self.X_train, y_train)
+            self._last_train_loss = train_loss
+            self._train_loss_history.append(train_loss)
+
+            if self.X_val is not None and self.y_val is not None and len(self.X_val) > 0:
+                val_loss = self._compute_prenet_loss(self.X_val, self.y_val)
+                self._last_val_loss = val_loss
+                self._val_loss_history.append(val_loss)
+
+    def _compute_prenet_loss(self, X: np.ndarray, y: np.ndarray) -> float:
+        """Compute PReNet pairwise ranking loss on given data."""
+        self.model.eval()
+        anomaly_idx = np.where(y == 1)[0]
+        normal_idx = np.where(y == 0)[0]
+        
+        if len(anomaly_idx) == 0 or len(normal_idx) == 0:
+            return 0.0
+        
+        X_tensor = torch.from_numpy(X).float()
+        
+        # Sample pairs for loss computation
+        num_pairs = min(100, len(anomaly_idx) * len(normal_idx))
+        losses = []
+        
+        with torch.no_grad():
+            for _ in range(num_pairs):
+                a_idx = np.random.choice(anomaly_idx)
+                n_idx = np.random.choice(normal_idx)
+                
+                x_a = X_tensor[a_idx:a_idx+1].to(self.device)
+                x_n = X_tensor[n_idx:n_idx+1].to(self.device)
+                
+                # PReNet should rank anomaly higher than normal
+                score_an = self.model(x_a, x_n)  # anomaly vs normal
+                score_nn = self.model(x_n, x_n)  # normal vs normal
+                
+                # Hinge loss: score(a,n) should be > score(n,n)
+                margin = 1.0
+                loss = torch.clamp(margin - (score_an - score_nn), min=0)
+                losses.append(loss.item())
+        
+        return float(np.mean(losses)) if losses else 0.0
+
+    def _get_labeled_indexes(self) -> tuple:
+        """Get indexes of labeled anomalies and normals for semi-supervised learning."""
+        labels = self.y_train
+        # Find samples with known labels (not -1 = unlabeled)
+        known_mask = labels != -1
+        anomaly_idx = np.where((labels == 1) & known_mask)[0]
+        normal_idx = np.where((labels == 0) & known_mask)[0]
+        return anomaly_idx, normal_idx
 
     def predict_scores(self, indexes: Optional[np.ndarray] = None, use_train: bool = False) -> np.ndarray:
         if not self._fitted:
             self.fit()
 
-        data_split = "X_train" if use_train else "X_test"
-        X_data = self.data.get(data_split, self.data["X_train"])
+        X_data = self.X_train if use_train else self.X_test
         X_batch = X_data if indexes is None else X_data[indexes]
 
         self.model.eval()
         scores = []
         num = 30
 
+        # Get labeled anomalies/normals (handles semi-supervised case)
+        anomaly_idx, normal_idx = self._get_labeled_indexes()
+        
+        # Fallback: if no labeled samples, use all samples with pseudo-heuristic
+        if len(anomaly_idx) == 0 or len(normal_idx) == 0:
+            # Use original labels as fallback
+            anomaly_idx = np.where(self.y_train_original == 1)[0]
+            normal_idx = np.where(self.y_train_original == 0)[0]
+
         for i in range(len(X_batch)):
-            index_a = np.random.choice(np.where(self.y_train == 1)[0], num, replace=True)
-            index_u = np.random.choice(np.where(self.y_train == 0)[0], num, replace=True)
+            index_a = np.random.choice(anomaly_idx, num, replace=True)
+            index_u = np.random.choice(normal_idx, num, replace=True)
 
             X_train_a = self.X_train_tensor[index_a]
             X_train_u = self.X_train_tensor[index_u]
@@ -161,12 +206,16 @@ class PReNetWrapper(Model):
             scores = (scores - s_min) / (s_max - s_min)
         return scores
 
-    def get_embeddings(self, indexes: Optional[np.ndarray] = None) -> np.ndarray:
+    def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True) -> np.ndarray:
         if not self._fitted:
             self.fit()
 
-        X_train = self.data["X_train"]
-        X_batch = X_train if indexes is None else X_train[indexes]
+        X_batch_source = self.X_train if use_train else self.X_test
+        if X_batch_source is None and not use_train:
+            X_batch_source = self.X_val
+        if X_batch_source is None:
+            raise ValueError(f"No data available for embeddings extraction (use_train={use_train})")
+        X_batch = X_batch_source if indexes is None else X_batch_source[indexes]
         tensor = torch.from_numpy(X_batch).float().to(self.device)
 
         self.model.eval()
@@ -174,12 +223,38 @@ class PReNetWrapper(Model):
             embeddings = self.model.feature(tensor).cpu().numpy()
         return embeddings
 
+    def get_loss(self, use_val: bool = False) -> Optional[float]:
+        """
+        Compute PReNet pairwise ranking loss.
+        
+        Args:
+            use_val: If True, return validation loss. Otherwise return training loss.
+        
+        PReNet uses a pairwise ranking loss: anomaly-normal pairs should have
+        higher scores than normal-normal pairs.
+        """
+        if not self._fitted:
+            return None
+        
+        if use_val:
+            if self._last_val_loss is not None:
+                return self._last_val_loss
+            # Compute validation loss on demand if not tracked during training
+            if self.X_val is not None and self.y_val is not None and len(self.X_val) > 0:
+                return self._compute_prenet_loss(self.X_val, self.y_val)
+            return None
+        
+        return self._last_train_loss
+    
+    def get_val_loss_history(self) -> list:
+        """Return validation loss history for plotting."""
+        return self._val_loss_history.copy() if hasattr(self, '_val_loss_history') else []
+
 
 class XGBODWrapper(Model):
     """Wrapper adapting PyOD XGBOD to the unified Model API."""
 
     def __init__(self, train_config: dict, model_config: dict, data: dict):
-        super().__init__()  # Initialize parent Model class
         if not PYOD_AVAILABLE:
             raise ImportError(
                 "PyOD not available. Install scikit-learn==1.0.2 and pyod==1.0.9 with --no-cache-dir"
@@ -189,58 +264,37 @@ class XGBODWrapper(Model):
             "seed": 42,
             "total_epochs": 10,
         }
-        self.train_config = {**defaults, **(train_config or {})}
-        self.model_config = model_config or {}
-        self.data = data
+        config = {**defaults, **(train_config or {})}
+        super().__init__(train_config=config, model_config=model_config, data=data)
+        
         self.detector: Optional[PYOD] = None
-        self._fitted = False
-        self._current_epoch = 0
-        self._pseudo_labels = None  # Will be set by CoLearner during collaborative learning
 
     def _build_detector(self) -> None:
         cfg = self.train_config
         self.detector = PYOD(seed=cfg["seed"], model_name="XGBOD", tune=False)
 
     def fit(self) -> None:
-        cfg = self.train_config
-        total_epochs = cfg["total_epochs"]
-
-        for epoch in range(self._current_epoch, total_epochs):
-            self.train(epoch)
+        remaining = self.train_config["total_epochs"] - self._current_epoch
+        if remaining > 0:
+            self.train(remaining)
         self._fitted = True
 
-    def train(self, epoch: int) -> None:
+    def train(self, epochs: int = 1) -> None:
         if self.detector is None:
             self._build_detector()
+        y_train = self.y_train.copy()
+        y_train[y_train == -1] = 0
 
-        X_train = self.data["X_train"]
-        
-        # Use pseudo-labels from CoLearner if available, otherwise use original labels
-        if self._pseudo_labels is not None:
-            y_pseudo = self._pseudo_labels
-            # Use only samples with valid pseudo-labels (not -1 = unknown)
-            valid_mask = y_pseudo != -1
-            if np.any(valid_mask):
-                y_train = y_pseudo.copy()
-                # For invalid samples, use original labels (if available)
-                y_train[~valid_mask] = self.data.get("y_train", None)[~valid_mask]
-            else:
-                # No valid pseudo-labels yet, use original
-                y_train = self.data.get("y_train", None)
-        else:
-            # Fall back to original labels (or None for unsupervised)
-            y_train = self.data.get("y_train", None)
-
-        self.detector.fit(X_train, y_train)
-        self._current_epoch = epoch + 1
+        for _ in range(epochs):
+            self.detector.fit(self.X_train, y_train)
+            self._current_epoch += 1
         self._fitted = True
 
     def predict_scores(self, indexes: Optional[np.ndarray] = None, use_train: bool = False) -> np.ndarray:
         if not self._fitted:
             self.fit()
 
-        data_split = "X_train" if use_train else "X_test"
-        X_data = self.data.get(data_split, self.data["X_train"])
+        X_data = self.X_train if use_train else self.X_test
         X_batch = X_data if indexes is None else X_data[indexes]
 
         scores = self.detector.model.decision_function(X_batch).astype(float)
@@ -250,12 +304,16 @@ class XGBODWrapper(Model):
             scores = (scores - s_min) / (s_max - s_min)
         return scores
 
-    def get_embeddings(self, indexes: Optional[np.ndarray] = None) -> np.ndarray:
+    def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True) -> np.ndarray:
         if not self._fitted:
             self.fit()
 
-        X_train = self.data["X_train"]
-        X_batch = X_train if indexes is None else X_train[indexes]
+        X_batch_source = self.X_train if use_train else self.X_test
+        if X_batch_source is None and not use_train:
+            X_batch_source = self.X_val
+        if X_batch_source is None:
+            raise ValueError(f"No data available for embeddings extraction (use_train={use_train})")
+        X_batch = X_batch_source if indexes is None else X_batch_source[indexes]
 
         embeddings = self.detector.model.decision_function(X_batch).astype(float)
         return embeddings.reshape(-1, 1)
@@ -265,7 +323,6 @@ class DeepSADWrapper(Model):
     """Wrapper adapting ADBench DeepSAD to the unified Model API."""
 
     def __init__(self, train_config: dict, model_config: dict, data: dict):
-        super().__init__()  # Initialize parent Model class
         defaults = {
             "seed": 42,
             "total_epochs": 50,
@@ -277,23 +334,21 @@ class DeepSADWrapper(Model):
             "eta": 1.0,
             "net_name": "dense",
         }
-        self.train_config = {**defaults, **(train_config or {})}
-        self.model_config = model_config or {}
-        self.data = data
-        self._current_epoch = 0
-        self._fitted = False
+        config = {**defaults, **(train_config or {})}
+        super().__init__(train_config=config, model_config=model_config, data=data)
+        
         self._pretrained = False
-        self._pseudo_labels = None  # Will be set by CoLearner during collaborative learning
 
         self.utils = Utils()
-        self.device = self.utils.get_device()
+        self.device = self.utils.get_device(gpu_specific=True)  # Enable GPU
 
         cfg = self.train_config
         self.utils.set_seed(cfg["seed"])
 
-        X_train = self.data["X_train"]
-        y_train = self.data["y_train"]
-        self.dataset = load_dataset(data={"X_train": X_train, "y_train": y_train}, train=True)
+        # Use y_train_original for init (no pseudo-labels yet); sanitize for DeepSAD
+        y_init = self.y_train_original.copy()
+        y_init[y_init == -1] = 0
+        self.dataset = load_dataset(data={"X_train": self.X_train, "y_train": y_init}, train=True)
         input_size = self.dataset.train_set.data.size(1)
 
         self.deepsad = deepsad(cfg["eta"])
@@ -305,7 +360,11 @@ class DeepSADWrapper(Model):
         self.weight_decay = cfg["weight_decay"]
         self.lr_milestones = []
 
-        if cfg["pretrain"] and not self._pretrained:
+        # Skip pretraining when semi-supervised labels exist (pretrain validation fails with partial labels)
+        has_unlabeled = (self.data is not None and
+                         getattr(self.data, 'semisupervised_labels', None) is not None)
+        
+        if cfg["pretrain"] and not self._pretrained and not has_unlabeled:
             self.deepsad.pretrain(
                 self.dataset,
                 input_size,
@@ -321,34 +380,25 @@ class DeepSADWrapper(Model):
             self._pretrained = True
 
         self.trainer = None
+        
+        # Loss tracking for plotting
+        self._train_loss_history = []
+        self._val_loss_history = []
+        self._last_train_loss = None
+        self._last_val_loss = None
 
     def fit(self) -> None:
-        cfg = self.train_config
-        total_epochs = cfg["total_epochs"]
-
-        for epoch in range(self._current_epoch, total_epochs):
-            self.train(epoch)
+        remaining = self.train_config["total_epochs"] - self._current_epoch
+        if remaining > 0:
+            self.train(remaining)
         self._fitted = True
 
-    def train(self, epoch: int) -> None:
-        # Use pseudo-labels from CoLearner if available, otherwise use original labels
-        if self._pseudo_labels is not None:
-            y_pseudo = self._pseudo_labels
-            # Use only samples with valid pseudo-labels (not -1 = unknown)
-            valid_mask = y_pseudo != -1
-            if np.any(valid_mask):
-                y_train = y_pseudo.copy()
-                # For invalid samples, use original labels (if available)
-                y_train[~valid_mask] = self.data["y_train"][~valid_mask]
-            else:
-                # No valid pseudo-labels yet, use original
-                y_train = self.data["y_train"]
-        else:
-            # Fall back to original labels
-            y_train = self.data["y_train"]
+    def train(self, epochs: int = 1) -> None:
+        y_train = self.y_train.copy()
+        y_train[y_train == -1] = 0
 
         self.dataset = load_dataset(
-            data={"X_train": self.data["X_train"], "y_train": y_train},
+            data={"X_train": self.X_train, "y_train": y_train},
             train=True,
         )
 
@@ -366,18 +416,28 @@ class DeepSADWrapper(Model):
                 n_jobs_dataloader=0,
             )
 
-        self.deepsad.net = self.trainer.train(self.dataset, self.deepsad.net)
-        self.deepsad.c = self.trainer.c.cpu().data.numpy().tolist()
+        for _ in range(epochs):
+            self.deepsad.net = self.trainer.train(self.dataset, self.deepsad.net)
+            self.deepsad.c = self.trainer.c.cpu().data.numpy().tolist()
+            self._current_epoch += 1
+            self._fitted = True
 
-        self._current_epoch = epoch + 1
-        self._fitted = True
+            train_loss = self._compute_deepsad_loss(self.X_train, self.y_train)
+            if train_loss is not None:
+                self._last_train_loss = train_loss
+                self._train_loss_history.append(train_loss)
+
+            if self.X_val is not None and self.y_val is not None and len(self.X_val) > 0:
+                val_loss = self._compute_deepsad_loss(self.X_val, self.y_val)
+                if val_loss is not None:
+                    self._last_val_loss = val_loss
+                    self._val_loss_history.append(val_loss)
 
     def predict_scores(self, indexes: Optional[np.ndarray] = None, use_train: bool = False) -> np.ndarray:
         if not self._fitted:
             self.fit()
 
-        data_split = "X_train" if use_train else "X_test"
-        X_data = self.data.get(data_split, self.data["X_train"])
+        X_data = self.X_train if use_train else self.X_test
         X_batch = X_data if indexes is None else X_data[indexes]
 
         test_dataset = load_dataset(
@@ -392,12 +452,16 @@ class DeepSADWrapper(Model):
             scores = (scores - s_min) / (s_max - s_min)
         return scores
 
-    def get_embeddings(self, indexes: Optional[np.ndarray] = None) -> np.ndarray:
+    def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True) -> np.ndarray:
         if not self._fitted:
             self.fit()
 
-        X_train = self.data["X_train"]
-        X_batch = X_train if indexes is None else X_train[indexes]
+        X_batch_source = self.X_train if use_train else self.X_test
+        if X_batch_source is None and not use_train:
+            X_batch_source = self.X_val
+        if X_batch_source is None:
+            raise ValueError(f"No data available for embeddings extraction (use_train={use_train})")
+        X_batch = X_batch_source if indexes is None else X_batch_source[indexes]
 
         tensor = torch.from_numpy(X_batch).float().to(self.device)
 
@@ -407,12 +471,65 @@ class DeepSADWrapper(Model):
 
         return embeddings
 
+    def _compute_deepsad_loss(self, X: np.ndarray, y: np.ndarray) -> Optional[float]:
+        """Compute DeepSAD hypersphere loss on given data."""
+        if self.trainer is None:
+            return None
+        
+        self.deepsad.net.eval()
+        c = torch.tensor(self.deepsad.c, device=self.device).float()
+        
+        with torch.no_grad():
+            tensor = torch.from_numpy(X).float().to(self.device)
+            outputs = self.deepsad.net(tensor)
+            dist = torch.sum((outputs - c) ** 2, dim=1)
+            
+            # Use provided labels (handle unlabeled as normal)
+            y_clean = y.copy()
+            y_clean[y_clean == -1] = 0
+            labels = torch.tensor(y_clean, device=self.device).float()
+            
+            # DeepSAD loss: normal samples minimize distance, anomalies maximize
+            losses = torch.where(
+                labels == 0,
+                dist,  # Normal: minimize distance
+                torch.clamp(self.train_config["eta"] - dist, min=0)  # Anomaly: maximize distance
+            )
+            loss = torch.mean(losses).item()
+        
+        return loss
+
+    def get_loss(self, use_val: bool = False) -> Optional[float]:
+        """
+        Compute DeepSAD hypersphere loss.
+        
+        Args:
+            use_val: If True, return validation loss. Otherwise return training loss.
+        
+        DeepSAD minimizes distance from center for normals, maximizes for anomalies.
+        """
+        if not self._fitted or self.trainer is None:
+            return None
+        
+        if use_val:
+            if self._last_val_loss is not None:
+                return self._last_val_loss
+            # Compute validation loss on demand if not tracked during training
+            if self.X_val is not None and self.y_val is not None and len(self.X_val) > 0:
+                return self._compute_deepsad_loss(self.X_val, self.y_val)
+            return None
+        
+        return self._last_train_loss
+    
+    def get_val_loss_history(self) -> list:
+        """Return validation loss history for plotting."""
+        return self._val_loss_history.copy() if hasattr(self, '_val_loss_history') else []
+
 
 class DevNetWrapper(Model):
     """Wrapper adapting ADBench DevNet to the unified Model API."""
 
     def __init__(self, train_config: dict, model_config: dict, data: dict):
-        super().__init__()  # Initialize parent Model class
         defaults = {
             "seed": 42,
             "total_epochs": 50,
@@ -420,12 +537,8 @@ class DevNetWrapper(Model):
             "nb_batch": 20,
             "network_depth": 2,  # 1, 2, or 4
         }
-        self.train_config = {**defaults, **(train_config or {})}
-        self.model_config = model_config or {}
-        self.data = data
-        self._current_epoch = 0
-        self._fitted = False
-        self._pseudo_labels = None  # Will be set by CoLearner during collaborative learning
+        config = {**defaults, **(train_config or {})}
+        super().__init__(train_config=config, model_config=model_config, data=data)
 
         self.devnet = DevNet(seed=self.train_config["seed"], save_suffix=self.model_config.get("save_suffix", "wrapper"))
         # Override parsed args to align with train_config
@@ -445,6 +558,12 @@ class DevNetWrapper(Model):
         self.outlier_indices = None
         self.inlier_indices = None
         self.rng = np.random.RandomState(self.train_config["seed"])
+        
+        # Loss tracking for plotting
+        self._train_loss_history = []
+        self._val_loss_history = []
+        self._last_train_loss = None
+        self._last_val_loss = None
 
     @staticmethod
     def _build_devnet_loss(ref_var: tf.Variable):
@@ -478,61 +597,51 @@ class DevNetWrapper(Model):
         self._model_path = self.devnet.modelpath + "/devnet_wrapper.h5"
 
     def fit(self) -> None:
-        cfg = self.train_config
-        total_epochs = cfg["total_epochs"]
-
-        for epoch in range(self._current_epoch, total_epochs):
-            self.train(epoch)
+        remaining = self.train_config["total_epochs"] - self._current_epoch
+        if remaining > 0:
+            self.train(remaining)
         self._fitted = True
 
-    def train(self, epoch: int) -> None:
-        X_train = self.data["X_train"]
-        
-        # Use pseudo-labels from CoLearner if available, otherwise use original labels
-        if self._pseudo_labels is not None:
-            y_pseudo = self._pseudo_labels
-            # Use only samples with valid pseudo-labels (not -1 = unknown)
-            valid_mask = y_pseudo != -1
-            if np.any(valid_mask):
-                y_train = y_pseudo.copy()
-                # For invalid samples, use original labels (if available)
-                y_train[~valid_mask] = self.data["y_train"][~valid_mask]
-            else:
-                # No valid pseudo-labels yet, use original
-                y_train = self.data["y_train"]
-        else:
-            # Fall back to original labels
-            y_train = self.data["y_train"]
+    def train(self, epochs: int = 1) -> None:
+        y_train = self.y_train.copy()
+        y_train[y_train == -1] = 0
 
-        # Refresh indices to reflect potential pseudo-label updates
         self.outlier_indices = np.where(y_train == 1)[0]
         self.inlier_indices = np.where(y_train == 0)[0]
-
-        self._ensure_model(X_train, y_train)
+        self._ensure_model(self.X_train, y_train)
 
         batch_size = self.train_config["batch_size"]
         nb_batch = self.train_config["nb_batch"]
-        generator = self.devnet.batch_generator_sup(
-            X_train,
-            self.outlier_indices,
-            self.inlier_indices,
-            batch_size,
-            nb_batch,
-            self.rng,
-        )
 
-        # Single-epoch training step (fit_generator deprecated in modern TF/Keras)
-        self.model.fit(generator, steps_per_epoch=nb_batch, epochs=1, verbose=0)
+        for _ in range(epochs):
+            generator = self.devnet.batch_generator_sup(
+                self.X_train,
+                self.outlier_indices,
+                self.inlier_indices,
+                batch_size,
+                nb_batch,
+                self.rng,
+            )
+            self.model.fit(generator, steps_per_epoch=nb_batch, epochs=1, verbose=0)
+            self._current_epoch += 1
+            self._fitted = True
 
-        self._current_epoch = epoch + 1
-        self._fitted = True
+            train_loss = self._compute_devnet_loss(self.X_train, self.y_train)
+            if train_loss is not None:
+                self._last_train_loss = train_loss
+                self._train_loss_history.append(train_loss)
+
+            if self.X_val is not None and self.y_val is not None and len(self.X_val) > 0:
+                val_loss = self._compute_devnet_loss(self.X_val, self.y_val)
+                if val_loss is not None:
+                    self._last_val_loss = val_loss
+                    self._val_loss_history.append(val_loss)
 
     def predict_scores(self, indexes: Optional[np.ndarray] = None, use_train: bool = False) -> np.ndarray:
         if not self._fitted:
             self.fit()
 
-        data_split = "X_train" if use_train else "X_test"
-        X_data = self.data.get(data_split, self.data["X_train"])
+        X_data = self.X_train if use_train else self.X_test
         X_batch = X_data if indexes is None else X_data[indexes]
 
         scores = self.model.predict(X_batch)
@@ -543,6 +652,58 @@ class DevNetWrapper(Model):
             scores = (scores - s_min) / (s_max - s_min)
         return scores
 
-    def get_embeddings(self, indexes: Optional[np.ndarray] = None) -> np.ndarray:
+    def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True) -> np.ndarray:
         # DevNet exposes only the score head; use scores as 1D embeddings
-        return self.predict_scores(indexes).reshape(-1, 1)
+        return self.predict_scores(indexes, use_train=use_train).reshape(-1, 1)
+
+    def _compute_devnet_loss(self, X: np.ndarray, y: np.ndarray) -> Optional[float]:
+        """Compute DevNet deviation loss on given data."""
+        if self.model is None:
+            return None
+        
+        # Handle unlabeled samples
+        y_clean = y.copy()
+        y_clean[y_clean == -1] = 0
+        
+        # Evaluate scores on provided data
+        scores = self.model.predict(X, verbose=0)
+        scores = np.asarray(scores).reshape(-1)
+        
+        # Compute deviation loss manually
+        ref_mean = np.mean(self.devnet.ref.numpy())
+        ref_std = np.std(self.devnet.ref.numpy())
+        dev = (scores - ref_mean) / (ref_std + 1e-8)
+        
+        confidence_margin = 5.0
+        inlier_loss = np.abs(dev)
+        outlier_loss = np.abs(np.maximum(0, confidence_margin - dev))
+        
+        losses = (1.0 - y_clean) * inlier_loss + y_clean * outlier_loss
+        return float(np.mean(losses))
+
+    def get_loss(self, use_val: bool = False) -> Optional[float]:
+        """
+        Compute DevNet deviation loss.
+        
+        Args:
+            use_val: If True, return validation loss. Otherwise return training loss.
+        
+        DevNet uses deviation loss: inliers should have small deviation,
+        outliers should have large deviation from reference scores.
+        """
+        if not self._fitted or self.model is None:
+            return None
+        
+        if use_val:
+            if self._last_val_loss is not None:
+                return self._last_val_loss
+            # Compute validation loss on demand if not tracked during training
+            if self.X_val is not None and self.y_val is not None and len(self.X_val) > 0:
+                return self._compute_devnet_loss(self.X_val, self.y_val)
+            return None
+        
+        return self._last_train_loss
+    
+    def get_val_loss_history(self) -> list:
+        """Return validation loss history for plotting."""
+        return self._val_loss_history.copy() if hasattr(self, '_val_loss_history') else []
