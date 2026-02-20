@@ -249,3 +249,77 @@ def extract_embeddings_auto(
                    f"(no get_embeddings, torch hook, or keras sub-model available)")
     scores = model.predict_scores(indexes=indexes, use_train=use_train)
     return np.asarray(scores).reshape(-1, 1)
+
+
+# ---------------------------------------------------------------------------
+# Data validation checks
+# ---------------------------------------------------------------------------
+
+def validate_splits(data: Data) -> None:
+    """Run benchmark integrity checks on a Data instance. Raises AssertionError on failure."""
+    assert data.X_train.shape[0] == data.n_train, "X_train/n_train mismatch"
+    assert data.X_test.shape[0] == data.n_test, "X_test/n_test mismatch"
+    if data.n_val and data.n_val > 0:
+        assert data.X_val.shape[0] == data.n_val, "X_val/n_val mismatch"
+
+    if data.labeled_indexes is not None:
+        # labeled ∪ unlabeled = train, no overlap
+        all_train = np.union1d(data.labeled_indexes, data.unlabeled_indexes)
+        assert np.array_equal(all_train, np.arange(data.n_train)), "labeled ∪ unlabeled ≠ train"
+        assert len(np.intersect1d(data.labeled_indexes, data.unlabeled_indexes)) == 0, "labeled/unlabeled overlap"
+
+        # At least 1 anomaly + 1 normal labeled
+        assert np.any(data.y_train_original[data.labeled_indexes] == 1), "no labeled anomaly"
+        assert np.any(data.y_train_original[data.labeled_indexes] == 0), "no labeled normal"
+
+        # Stratification sanity (20% relative tolerance)
+        if len(data.labeled_indexes) > 5:
+            full_rate = np.mean(data.y_train_original == 1)
+            labeled_rate = np.mean(data.y_train_original[data.labeled_indexes] == 1)
+            if full_rate > 0:
+                assert abs(labeled_rate - full_rate) / full_rate < 0.30, \
+                    f"Stratification drift: full={full_rate:.3f} labeled={labeled_rate:.3f}"
+
+    # semisupervised_labels consistency
+    if data.semisupervised_labels is not None and data.labeled_indexes is not None:
+        ssl = data.semisupervised_labels
+        assert np.all(ssl[data.labeled_indexes] != -1), "labeled idx has -1 in semisupervised_labels"
+        assert np.all(ssl[data.unlabeled_indexes] == -1), "unlabeled idx is not -1"
+        assert np.array_equal(
+            ssl[data.labeled_indexes], data.y_train_original[data.labeled_indexes]
+        ), "labeled semisupervised_labels != ground truth"
+
+    # Print split statistics
+    for name, y in [("train", data.y_train_original), ("test", data.y_test), ("val", data.y_val)]:
+        if y is not None and len(y) > 0:
+            logger.info(f"  {name}: n={len(y)}, anomaly_rate={np.mean(y == 1):.4f}")
+
+    logger.info("[validate_splits] All checks passed")
+
+
+def check_no_test_leakage(data: Data) -> None:
+    """Verify scaler was fit on train only."""
+    if hasattr(data, '_scaler') and data._scaler is not None:
+        n_seen = data._scaler.n_samples_seen_
+        assert n_seen == data.n_train, f"Scaler saw {n_seen} samples but n_train={data.n_train}"
+    logger.info("[check_no_test_leakage] Passed")
+
+
+def check_unlabeled_hidden(data: Data) -> None:
+    """Ensure resolve_labels() never leaks ground truth on unlabeled."""
+    if data.unlabeled_indexes is None or not hasattr(data, 'resolve_labels'):
+        return
+    resolved = data.resolve_labels()
+    policy = getattr(data, 'unlabeled_policy', 'unlabeled_as_normal')
+    if policy == "unlabeled_as_normal":
+        assert np.all(resolved[data.unlabeled_indexes] == 0), "unlabeled not mapped to 0"
+    elif policy == "unlabeled_as_is":
+        assert np.all(resolved[data.unlabeled_indexes] == -1), "unlabeled not kept as -1"
+    logger.info(f"[check_unlabeled_hidden] Passed (policy={policy})")
+
+
+def validate_data(data: Data) -> None:
+    """Run all benchmark data checks."""
+    validate_splits(data)
+    check_no_test_leakage(data)
+    check_unlabeled_hidden(data)

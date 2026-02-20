@@ -16,10 +16,12 @@ class SimpleCoLearner(CoLearning):
                  warmup_epochs: int = 10, max_chapters: int = 10,
                  anomaly_threshold: float = 0.5, confidence_threshold_low: float = 0.02,
                  confidence_threshold_high: float = 0.98, keep_truth: bool = True,
-                 transfer_thresholds: Optional[Dict] = None):
+                 transfer_thresholds: Optional[Dict] = None,
+                 pseudo_label_arbiter=None):
         super().__init__(models, data, strategy, warmup_epochs, max_chapters,
                          anomaly_threshold, confidence_threshold_low, confidence_threshold_high,
-                         transfer_thresholds=transfer_thresholds)
+                         transfer_thresholds=transfer_thresholds,
+                         pseudo_label_arbiter=pseudo_label_arbiter)
         self.keep_truth = keep_truth  # If True, only exchange on unlabeled; if False, exchange on all
         for model in models:
             model.clear_pseudo_labels()
@@ -78,6 +80,9 @@ class SimpleCoLearner(CoLearning):
         exchange_stats["normal_precision"] = cn / nn if nn else 0.0
         exchange_stats["overall_precision"] = (ca + cn) / max(1, na + nn)
         self.exchange_history.append(exchange_stats)
+
+        # Resolve conflicts via arbiter and write final pseudo-labels
+        self._finalize_pseudo_labels()
 
         all_scores = np.array(list(self.model_scores.values()))
         self.ensemble_scores = np.mean(all_scores, axis=0)
@@ -144,7 +149,7 @@ class RecurrentCoLearner(SimpleCoLearner):
         embeddings_layer: Optional[str] = None,
         embeddings_batch_size: int = 1024,
         embeddings_use_train: bool = True,
-        embeddings_use_unlabeled: bool = True,
+        embeddings_use_unlabeled: bool = False,
         embeddings_aggregate: str = "concat",
         **kwargs,
     ):
@@ -172,8 +177,10 @@ class RecurrentCoLearner(SimpleCoLearner):
         return None
 
     def _resolve_recurrent_labels(self, indexes: Optional[np.ndarray]) -> Optional[np.ndarray]:
-        """Get labels for recurrent training: semisupervised + pseudo-labels, unknowns→0."""
-        if getattr(self.data, "semisupervised_labels", None) is not None:
+        """Get labels for recurrent training: resolved base + pseudo-labels from arbiter."""
+        if hasattr(self.data, 'resolve_labels'):
+            labels = self.data.resolve_labels(policy="unlabeled_as_is")
+        elif getattr(self.data, "semisupervised_labels", None) is not None:
             labels = self.data.semisupervised_labels.copy()
         elif getattr(self.data, "y_train_original", None) is not None:
             labels = self.data.y_train_original.copy()
@@ -193,7 +200,6 @@ class RecurrentCoLearner(SimpleCoLearner):
                 votes = pseudo_array[:, i][pseudo_array[:, i] != -1]
                 labels[i] = int(np.round(np.mean(votes)))
 
-        labels[labels == -1] = 0
         return labels if indexes is None else labels[indexes]
 
     def _collect_embeddings(self, indexes: Optional[np.ndarray]) -> np.ndarray:

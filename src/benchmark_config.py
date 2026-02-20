@@ -54,11 +54,11 @@ EVAL_DATASETS = {
 
 MODEL_CONFIGS = {
     "prenet": {
-        "total_epochs": 5,
+        "total_epochs": 100,
         "batch_size": 256,
     },
     "deepsad": {
-        "total_epochs": 10,
+        "total_epochs": 100,
         "pretrain": True,
         "ae_epochs": 20,
         "batch_size": 128,

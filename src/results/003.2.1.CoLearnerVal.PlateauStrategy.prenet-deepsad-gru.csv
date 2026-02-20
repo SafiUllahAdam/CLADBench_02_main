@@ -1,0 +1,18 @@
+#META:{"test_id": 3, "dataset": "annthyroid", "dataset_path": "/home/peppino58/CoBench/SubModules/ADBench/adbench/datasets/Classical/2_annthyroid.npz", "n_trials": 10, "seeds": [58, 59, 60, 61, 62, 63, 64, 65, 66, 67], "models": ["prenet", "deepsad"], "n_models": 2, "has_recurrent": true, "recurrent_model": "gru", "colearner": "CoLearnerVal", "strategy": "PlateauStrategy", "warmup_epochs": 10, "max_chapters": 10, "epochs_per_chapter": 1, "gru_start_chapter": 3, "train_split": 0.6, "val_test_split": 0.5, "semi_label_ratio": 0.1, "timestamp": "2026-02-19T19:52:17.272549"}
+method,mean,std,min,q25,median,q75,max,n_trials
+solo_prenet_auc,0.737746,0.040621,0.670534,0.718098,0.744757,0.761775,0.800387,10
+solo_prenet_ap,0.315995,0.060374,0.198494,0.287678,0.313404,0.352747,0.432254,10
+solo_deepsad_auc,0.825293,0.044865,0.749613,0.793095,0.826346,0.848322,0.897168,10
+solo_deepsad_ap,0.399962,0.116138,0.247902,0.315176,0.398736,0.438183,0.686392,10
+collab_prenet_auc,0.774881,0.029301,0.716008,0.758983,0.779263,0.795272,0.814227,10
+collab_prenet_ap,0.371671,0.050776,0.262369,0.352845,0.358628,0.416345,0.443719,10
+collab_deepsad_auc,0.870917,0.018784,0.836683,0.862207,0.868139,0.875847,0.905399,10
+collab_deepsad_ap,0.504169,0.065087,0.427035,0.443067,0.517068,0.523061,0.614686,10
+collab_ensemble_auc,0.829844,0.029412,0.791308,0.801421,0.828978,0.856330,0.870007,10
+collab_ensemble_ap,0.476315,0.058124,0.367940,0.459107,0.490080,0.522805,0.540363,10
+gru_judge_auc,0.834279,0.026711,0.772090,0.828568,0.845749,0.848821,0.858285,10
+gru_judge_ap,0.482264,0.050984,0.395149,0.443050,0.493386,0.521507,0.552931,10
+delta_prenet_auc,0.037134,0.018732,-0.002194,0.025799,0.039469,0.049488,0.068807,10
+delta_prenet_ap,0.055676,0.022813,0.011465,0.049657,0.060310,0.063731,0.088738,10
+delta_deepsad_auc,0.045624,0.037871,-0.026944,0.015221,0.057810,0.078601,0.087071,10
+delta_deepsad_ap,0.104207,0.115128,-0.169611,0.061318,0.127174,0.179663,0.270502,10

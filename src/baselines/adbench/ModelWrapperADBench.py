@@ -91,7 +91,6 @@ class PReNetWrapper(Model):
     def train(self, epochs: int = 1) -> None:
         """Train for `epochs` epochs with current pseudo-labels."""
         y_train = self.y_train.copy()
-        y_train[y_train == -1] = 0
         cfg = self.train_config
 
         for _ in range(epochs):
@@ -283,7 +282,6 @@ class XGBODWrapper(Model):
         if self.detector is None:
             self._build_detector()
         y_train = self.y_train.copy()
-        y_train[y_train == -1] = 0
 
         for _ in range(epochs):
             self.detector.fit(self.X_train, y_train)
@@ -345,9 +343,12 @@ class DeepSADWrapper(Model):
         cfg = self.train_config
         self.utils.set_seed(cfg["seed"])
 
-        # Use y_train_original for init (no pseudo-labels yet); sanitize for DeepSAD
-        y_init = self.y_train_original.copy()
-        y_init[y_init == -1] = 0
+        # Use resolved labels for init (no pseudo-labels yet)
+        if self.data is not None and hasattr(self.data, 'resolve_labels'):
+            y_init = self.data.resolve_labels()
+        else:
+            y_init = self.y_train_original.copy()
+            y_init[y_init == -1] = 0
         self.dataset = load_dataset(data={"X_train": self.X_train, "y_train": y_init}, train=True)
         input_size = self.dataset.train_set.data.size(1)
 
@@ -395,7 +396,6 @@ class DeepSADWrapper(Model):
 
     def train(self, epochs: int = 1) -> None:
         y_train = self.y_train.copy()
-        y_train[y_train == -1] = 0
 
         self.dataset = load_dataset(
             data={"X_train": self.X_train, "y_train": y_train},
@@ -484,10 +484,7 @@ class DeepSADWrapper(Model):
             outputs = self.deepsad.net(tensor)
             dist = torch.sum((outputs - c) ** 2, dim=1)
             
-            # Use provided labels (handle unlabeled as normal)
-            y_clean = y.copy()
-            y_clean[y_clean == -1] = 0
-            labels = torch.tensor(y_clean, device=self.device).float()
+            labels = torch.tensor(y, device=self.device).float()
             
             # DeepSAD loss: normal samples minimize distance, anomalies maximize
             losses = torch.where(
@@ -604,7 +601,6 @@ class DevNetWrapper(Model):
 
     def train(self, epochs: int = 1) -> None:
         y_train = self.y_train.copy()
-        y_train[y_train == -1] = 0
 
         self.outlier_indices = np.where(y_train == 1)[0]
         self.inlier_indices = np.where(y_train == 0)[0]
@@ -661,9 +657,7 @@ class DevNetWrapper(Model):
         if self.model is None:
             return None
         
-        # Handle unlabeled samples
         y_clean = y.copy()
-        y_clean[y_clean == -1] = 0
         
         # Evaluate scores on provided data
         scores = self.model.predict(X, verbose=0)

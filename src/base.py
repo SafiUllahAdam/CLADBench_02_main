@@ -1,10 +1,28 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Callable, Tuple
 import logging
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+UNLABELED_POLICIES = ("unlabeled_as_normal", "unlabeled_as_is", "unlabeled_as_removed")
+
+
+@dataclass
+class PseudoLabelProposal:
+    """One model's proposed label for one sample."""
+    sender_idx: int
+    label: int          # 0 or 1
+    confidence: float   # distance from threshold (higher = more confident)
+
+
+def default_arbiter(proposals: List[PseudoLabelProposal]) -> Optional[int]:
+    """Pick the proposal with highest confidence (threshold-margin). Returns 0/1 or None."""
+    if not proposals:
+        return None
+    best = max(proposals, key=lambda p: p.confidence)
+    return best.label
 
 
 class Model(ABC):
@@ -23,6 +41,7 @@ class Model(ABC):
         self._fitted = False
         self._current_epoch = 0
         self._pseudo_labels = None
+        self._pseudo_label_meta: Optional[Dict[int, PseudoLabelProposal]] = None  # idx → winning proposal
         
         # Per-model default transfer thresholds (fallback before CoLearner defaults)
         self.default_confidence_high: Optional[float] = None
@@ -67,9 +86,10 @@ class Model(ABC):
             
     @property
     def y_train(self) -> np.ndarray:
-        """Training labels: pseudo_labels → semisupervised_labels → original."""
-        base_labels = None
-        if self.data is not None and getattr(self.data, 'semisupervised_labels', None) is not None:
+        """Training labels: pseudo_labels → resolved semisupervised_labels → original."""
+        if self.data is not None and hasattr(self.data, 'resolve_labels'):
+            base_labels = self.data.resolve_labels()
+        elif self.data is not None and getattr(self.data, 'semisupervised_labels', None) is not None:
             base_labels = self.data.semisupervised_labels
         else:
             base_labels = self.y_train_original
@@ -91,6 +111,7 @@ class Model(ABC):
     
     def clear_pseudo_labels(self) -> None:
         self._pseudo_labels = None
+        self._pseudo_label_meta = None
     
     @abstractmethod
     def train(self, epochs: int = 1) -> None:
@@ -138,13 +159,15 @@ class Data(ABC):
                  preserve_labeled: bool = False, data_type: str = "tabular", 
                  val_test_split: float = 0.0,
                  labeled_ratio: Optional[float] = None, stratified: bool = True,
-                 max_anomalies: Optional[int] = None, anomaly_ratio: Optional[float] = None):
+                 max_anomalies: Optional[int] = None, anomaly_ratio: Optional[float] = None,
+                 unlabeled_policy: str = "unlabeled_as_normal"):
         self.dataset = dataset
         self.train_test_split = train_test_split
         self.val_test_split = val_test_split
         self.random_state = random_state
         self.preserve_labeled = preserve_labeled
         self.data_type = data_type
+        self.unlabeled_policy = unlabeled_policy
         
         self.n_samples = None
         self.n_train = None
@@ -168,7 +191,8 @@ class Data(ABC):
         if labeled_ratio is not None:
             self.generate_semisupervised_split(
                 labeled_ratio=labeled_ratio, stratified=stratified,
-                max_anomalies=max_anomalies, anomaly_ratio=anomaly_ratio)
+                max_anomalies=max_anomalies, anomaly_ratio=anomaly_ratio,
+                unlabeled_policy=unlabeled_policy)
     
     @abstractmethod
     def load_and_split(self) -> None:
@@ -178,11 +202,15 @@ class Data(ABC):
     def generate_semisupervised_split(self,
                                       labeled_ratio: float = 0.1, stratified: bool = True,
                                       max_anomalies: Optional[int] = None,
-                                      anomaly_ratio: Optional[float] = None) -> None:
+                                      anomaly_ratio: Optional[float] = None,
+                                      unlabeled_policy: str = "unlabeled_as_normal") -> None:
         if self.y_train_original is None:
             raise ValueError("load_and_split() must set y_train_original first")
+        if unlabeled_policy not in UNLABELED_POLICIES:
+            raise ValueError(f"Unknown policy '{unlabeled_policy}', choose from {UNLABELED_POLICIES}")
     
         seed = self.random_state
+        self.unlabeled_policy = unlabeled_policy
     
         from sklearn.model_selection import train_test_split
         
@@ -207,12 +235,44 @@ class Data(ABC):
             self.labeled_indexes = np.sort(self.labeled_indexes)
             self.unlabeled_indexes = np.sort(self.unlabeled_indexes)
     
+        # Guardrail: ensure at least 1 anomaly and 1 normal labeled
+        n_anom = np.sum(self.y_train_original[self.labeled_indexes] == 1)
+        n_norm = np.sum(self.y_train_original[self.labeled_indexes] == 0)
+        if n_anom == 0 and len(anomaly_idx) > 0:
+            logger.warning("No labeled anomalies — injecting 1 random anomaly into labeled set")
+            pick = rng.choice(anomaly_idx, 1)
+            self.labeled_indexes = np.sort(np.union1d(self.labeled_indexes, pick))
+            self.unlabeled_indexes = np.sort(np.setdiff1d(np.arange(self.n_train), self.labeled_indexes))
+        if n_norm == 0 and len(normal_idx) > 0:
+            logger.warning("No labeled normals — injecting 1 random normal into labeled set")
+            pick = rng.choice(normal_idx, 1)
+            self.labeled_indexes = np.sort(np.union1d(self.labeled_indexes, pick))
+            self.unlabeled_indexes = np.sort(np.setdiff1d(np.arange(self.n_train), self.labeled_indexes))
+
         self.semisupervised_labels = np.full(self.n_train, -1, dtype=np.int32)
         self.semisupervised_labels[self.labeled_indexes] = self.y_train_original[self.labeled_indexes]
         
         n_anom = np.sum(self.y_train_original[self.labeled_indexes] == 1)
         n_norm = np.sum(self.y_train_original[self.labeled_indexes] == 0)
-        logger.info(f"[Semi-supervised] Labeled: {len(self.labeled_indexes)} ({n_norm} normal, {n_anom} anomaly), Unlabeled: {len(self.unlabeled_indexes)}")
+        logger.info(f"[Semi-supervised] Labeled: {len(self.labeled_indexes)} ({n_norm} normal, {n_anom} anomaly), "
+                    f"Unlabeled: {len(self.unlabeled_indexes)}, Policy: {unlabeled_policy}")
+
+    def resolve_labels(self, policy: str = None) -> np.ndarray:
+        """Return training labels with unlabeled (-1) resolved per policy."""
+        policy = policy or getattr(self, 'unlabeled_policy', 'unlabeled_as_normal')
+        labels = self.semisupervised_labels if self.semisupervised_labels is not None else self.y_train_original
+        if labels is None:
+            raise ValueError("No training labels available")
+        out = labels.copy()
+        if policy == "unlabeled_as_normal":
+            out[out == -1] = 0
+        elif policy == "unlabeled_as_is":
+            pass
+        elif policy == "unlabeled_as_removed":
+            pass  # caller uses labeled_indexes to subset X
+        else:
+            raise ValueError(f"Unknown policy: {policy}")
+        return out
     
 class Strategy(ABC):
     """Convergence strategy for handling asynchronous model training."""
@@ -233,7 +293,8 @@ class CoLearning(ABC):
                  warmup_epochs: int = 10, max_chapters: int = 10,
                  anomaly_threshold: float = 0.5, confidence_threshold_low: float = 0.02,
                  confidence_threshold_high: float = 0.98,
-                 transfer_thresholds: Optional[Dict] = None):
+                 transfer_thresholds: Optional[Dict] = None,
+                 pseudo_label_arbiter: Optional[Callable[[List[PseudoLabelProposal]], Optional[int]]] = None):
         self.models = models
         self.data = data
         self.strategy = strategy
@@ -244,6 +305,7 @@ class CoLearning(ABC):
         self.confidence_threshold_high = confidence_threshold_high
         self.transfer_thresholds = transfer_thresholds or {} # example : {(0,1) : {"high":None, "low": 0.02,model 0 sends no anomalies to 1
         self.training_history: List[Dict] = []               #             (0,2) : {"high":0.6, "low":0.02}} model 0 sends score>0.6 as anomalies to 2
+        self.pseudo_label_arbiter = pseudo_label_arbiter or default_arbiter
 
     def _resolve_threshold(self, sender_idx: int, receiver_idx: int, kind: str) -> Optional[float]:
         """Resolve threshold: pair override > sender model default > colearner default | None = disabled"""
@@ -259,41 +321,56 @@ class CoLearning(ABC):
         model_val = sender.default_confidence_low
         return model_val if model_val is not None else self.confidence_threshold_low
 
-    def send_anomalies(self, sender_idx: int, receiver_idx: int,
-                       indexes: np.ndarray, scores: np.ndarray) -> int:
-        """Send high-confidence anomaly pseudo-labels from sender to one receiver. Returns count sent."""
+    def _propose_labels(self, sender_idx: int, receiver_idx: int,
+                        indexes: np.ndarray, scores: np.ndarray,
+                        label: int, kind: str) -> int:
+        """Accumulate proposals for receiver; arbiter resolves conflicts later. Returns count proposed."""
         if len(indexes) == 0:
             return 0
-        threshold = self._resolve_threshold(sender_idx, receiver_idx, "high")
+        threshold = self._resolve_threshold(sender_idx, receiver_idx, kind)
         if threshold is None:
             return 0
-        mask = scores[indexes] > threshold
+        if kind == "high":
+            mask = scores[indexes] > threshold
+            confidences = scores[indexes][mask] - threshold
+        else:
+            mask = scores[indexes] < threshold
+            confidences = threshold - scores[indexes][mask]
         idxs = indexes[mask]
         if len(idxs) == 0:
             return 0
         receiver = self.models[receiver_idx]
-        if receiver._pseudo_labels is None:
-            receiver._pseudo_labels = np.full(self.data.n_train, -1, dtype=np.int32)
-        receiver._pseudo_labels[idxs] = 1
+        if receiver._pseudo_label_meta is None:
+            receiver._pseudo_label_meta = {}
+        for j, idx in enumerate(idxs):
+            proposal = PseudoLabelProposal(sender_idx=sender_idx, label=label, confidence=float(confidences[j]))
+            receiver._pseudo_label_meta.setdefault(int(idx), []).append(proposal)
         return len(idxs)
+
+    def _finalize_pseudo_labels(self) -> None:
+        """Resolve accumulated proposals via arbiter and write final pseudo-labels."""
+        for receiver in self.models:
+            if receiver._pseudo_label_meta is None:
+                continue
+            receiver._pseudo_labels = np.full(self.data.n_train, -1, dtype=np.int32)
+            resolved_meta = {}
+            for idx, proposals in receiver._pseudo_label_meta.items():
+                decision = self.pseudo_label_arbiter(proposals)
+                if decision is not None:
+                    receiver._pseudo_labels[idx] = decision
+                    best = max(proposals, key=lambda p: p.confidence)
+                    resolved_meta[idx] = best
+            receiver._pseudo_label_meta = resolved_meta
+
+    def send_anomalies(self, sender_idx: int, receiver_idx: int,
+                       indexes: np.ndarray, scores: np.ndarray) -> int:
+        """Propose high-confidence anomaly pseudo-labels from sender to receiver."""
+        return self._propose_labels(sender_idx, receiver_idx, indexes, scores, label=1, kind="high")
 
     def send_normals(self, sender_idx: int, receiver_idx: int,
                      indexes: np.ndarray, scores: np.ndarray) -> int:
-        """Send high-confidence normal pseudo-labels from sender to one receiver. Returns count sent."""
-        if len(indexes) == 0:
-            return 0
-        threshold = self._resolve_threshold(sender_idx, receiver_idx, "low")
-        if threshold is None:
-            return 0
-        mask = scores[indexes] < threshold
-        idxs = indexes[mask]
-        if len(idxs) == 0:
-            return 0
-        receiver = self.models[receiver_idx]
-        if receiver._pseudo_labels is None:
-            receiver._pseudo_labels = np.full(self.data.n_train, -1, dtype=np.int32)
-        receiver._pseudo_labels[idxs] = 0
-        return len(idxs)
+        """Propose high-confidence normal pseudo-labels from sender to receiver."""
+        return self._propose_labels(sender_idx, receiver_idx, indexes, scores, label=0, kind="low")
 
     @abstractmethod
     def exchange(self) -> None:

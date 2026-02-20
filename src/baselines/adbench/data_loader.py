@@ -28,7 +28,8 @@ class ClassicalADBenchData(Data):
                  labeled_ratio=None,
                  stratified=True,
                  max_anomalies=None,
-                 anomaly_ratio=None):
+                 anomaly_ratio=None,
+                 unlabeled_policy: str = "unlabeled_as_normal"):
         """
         Initialize Classical ADBench dataset.
         
@@ -44,6 +45,7 @@ class ClassicalADBenchData(Data):
             stratified: Stratified semi-supervised split (default True)
             max_anomalies: Cap on visible anomalies in semi-supervised split
             anomaly_ratio: Fraction of anomalies visible in semi-supervised split
+            unlabeled_policy: How to resolve -1 labels (default "unlabeled_as_normal")
         """
         self.dataset_path = Path(dataset_path)
         self.normalize = normalize
@@ -70,7 +72,8 @@ class ClassicalADBenchData(Data):
             labeled_ratio=labeled_ratio,
             stratified=stratified,
             max_anomalies=max_anomalies,
-            anomaly_ratio=anomaly_ratio
+            anomaly_ratio=anomaly_ratio,
+            unlabeled_policy=unlabeled_policy
         )
     
     def assign_global_indexes(self) -> None:
