@@ -16,7 +16,7 @@ Strategy (convergence control: plateau, adaptive, recurrent-aware)
 
 ### Data (`base.py` → `Data`, `data_loader.py` → `ClassicalADBenchData`)
 - Loads tabular datasets (ADBench `.npz` format), splits into train/val/test (stratified, seeded)
-- Within train: partitions into labeled / unlabeled via `generate_semisupervised_split` (configurable ratio, stratification, anomaly caps, guardrails for extreme imbalance)
+- Within train: partitions into labeled / unlabeled at init time (`_init_semisupervised`, called automatically after `_load`; single constructor, no manual second call)
 - **Unlabeled policy** — centralized via `resolve_labels(policy)`:
   - `unlabeled_as_normal` (default): `-1 → 0`
   - `unlabeled_as_is`: keeps `-1` for natively semi-supervised models

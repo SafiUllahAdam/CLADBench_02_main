@@ -1,3 +1,3 @@
-I need clear code as i work for a hospital, the COBench we are building has to be research-grade and to be publishable. We test collaborative learning in semi supervised anomaly detection (pseudo-labelling on unknown labels between models), thus we want to adapt and fuse GADBench, ADBench and PyGOD benchmarks. 
+I need clear code as i work for a hospital, the COBench we are building has to be research-grade and be publishable. We test collaborative learning in semi supervised anomaly detection (pseudo-labelling on unknown labels between models), thus we want to adapt and fuse GADBench, ADBench and PyGOD benchmarks. 
 
 I want as few functions as possible, each clear and effective, the base classes are Model (with train(epochs) function, not a regulat fit() ), clear and 1 line max comments per function

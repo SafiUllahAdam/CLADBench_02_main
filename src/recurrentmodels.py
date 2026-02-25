@@ -44,14 +44,11 @@ class GRURecurrentModel(RecurrentModel):
 		self._last_loss: Optional[float] = None
 		self._train_loss_history: list[float] = []
 		self._val_loss_history: list[float] = []
-		self._val_embeddings: Optional[np.ndarray] = None
-		self._val_labels: Optional[np.ndarray] = None
 
 		if seed is not None:
 			self._set_seed(seed)
 
 	def _set_seed(self, seed: int) -> None:
-		np.random.seed(seed)
 		torch.manual_seed(seed)
 		if torch.cuda.is_available():
 			torch.cuda.manual_seed_all(seed)
@@ -112,10 +109,6 @@ class GRURecurrentModel(RecurrentModel):
 		_, h_n = self._gru(x)
 		return self._classifier(h_n[-1]).squeeze(-1)
 
-	def set_validation_data(self, aggregated_embeddings: np.ndarray, labels: np.ndarray) -> None:
-		self._val_embeddings = np.asarray(aggregated_embeddings, dtype=np.float32)
-		self._val_labels = np.asarray(labels, dtype=np.float32).reshape(-1)
-
 	def _train_epochs(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor, epochs: int) -> None:
 		if self._optimizer is None:
 			raise RuntimeError("Optimizer not initialized.")
@@ -153,11 +146,6 @@ class GRURecurrentModel(RecurrentModel):
 				epoch_loss = float(np.mean(epoch_losses))
 				self._last_loss = epoch_loss
 				self._train_loss_history.append(epoch_loss)
-
-			if self._val_embeddings is not None and self._val_labels is not None:
-				val_loss = self.get_loss(self._val_embeddings, self._val_labels)
-				if val_loss is not None:
-					self._val_loss_history.append(val_loss)
 
 		self._fitted = True
 

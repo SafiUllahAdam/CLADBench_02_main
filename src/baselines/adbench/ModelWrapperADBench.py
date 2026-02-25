@@ -90,7 +90,7 @@ class PReNetWrapper(Model):
 
     def train(self, epochs: int = 1) -> None:
         """Train for `epochs` epochs with current pseudo-labels."""
-        y_train = self.y_train.copy()
+        y_train = self.y_train
         cfg = self.train_config
 
         for _ in range(epochs):
@@ -120,38 +120,30 @@ class PReNetWrapper(Model):
                 self._val_loss_history.append(val_loss)
 
     def _compute_prenet_loss(self, X: np.ndarray, y: np.ndarray) -> float:
-        """Compute PReNet pairwise ranking loss on given data."""
+        """Compute PReNet pairwise ranking loss on given data (batched)."""
         self.model.eval()
         anomaly_idx = np.where(y == 1)[0]
         normal_idx = np.where(y == 0)[0]
-        
+
         if len(anomaly_idx) == 0 or len(normal_idx) == 0:
             return 0.0
-        
+
         X_tensor = torch.from_numpy(X).float()
-        
-        # Sample pairs for loss computation
         num_pairs = min(100, len(anomaly_idx) * len(normal_idx))
-        losses = []
-        
+
+        # Sample all pairs at once and batch the forward passes
+        a_idxs = np.random.choice(anomaly_idx, num_pairs, replace=True)
+        n_idxs = np.random.choice(normal_idx, num_pairs, replace=True)
+
+        x_a = X_tensor[a_idxs].to(self.device)
+        x_n = X_tensor[n_idxs].to(self.device)
+
         with torch.no_grad():
-            for _ in range(num_pairs):
-                a_idx = np.random.choice(anomaly_idx)
-                n_idx = np.random.choice(normal_idx)
-                
-                x_a = X_tensor[a_idx:a_idx+1].to(self.device)
-                x_n = X_tensor[n_idx:n_idx+1].to(self.device)
-                
-                # PReNet should rank anomaly higher than normal
-                score_an = self.model(x_a, x_n)  # anomaly vs normal
-                score_nn = self.model(x_n, x_n)  # normal vs normal
-                
-                # Hinge loss: score(a,n) should be > score(n,n)
-                margin = 1.0
-                loss = torch.clamp(margin - (score_an - score_nn), min=0)
-                losses.append(loss.item())
-        
-        return float(np.mean(losses)) if losses else 0.0
+            score_an = self.model(x_a, x_n)
+            score_nn = self.model(x_n, x_n)
+            loss = torch.clamp(1.0 - (score_an - score_nn), min=0).mean().item()
+
+        return loss
 
     def _get_labeled_indexes(self) -> tuple:
         """Get indexes of labeled anomalies and normals for semi-supervised learning."""
@@ -170,35 +162,40 @@ class PReNetWrapper(Model):
         X_batch = X_data if indexes is None else X_data[indexes]
 
         self.model.eval()
-        scores = []
         num = 30
 
         # Get labeled anomalies/normals (handles semi-supervised case)
         anomaly_idx, normal_idx = self._get_labeled_indexes()
-        
-        # Fallback: if no labeled samples, use all samples with pseudo-heuristic
+
+        # Fallback: if no labeled samples, use original labels
         if len(anomaly_idx) == 0 or len(normal_idx) == 0:
-            # Use original labels as fallback
             anomaly_idx = np.where(self.y_train_original == 1)[0]
             normal_idx = np.where(self.y_train_original == 0)[0]
 
-        for i in range(len(X_batch)):
-            index_a = np.random.choice(anomaly_idx, num, replace=True)
-            index_u = np.random.choice(normal_idx, num, replace=True)
+        # Batched scoring: process all samples at once
+        n = len(X_batch)
+        index_a = np.random.choice(anomaly_idx, (n, num), replace=True)
+        index_u = np.random.choice(normal_idx, (n, num), replace=True)
 
-            X_train_a = self.X_train_tensor[index_a]
-            X_train_u = self.X_train_tensor[index_u]
+        X_batch_tensor = torch.from_numpy(X_batch).float().to(self.device)
 
-            X_i = torch.from_numpy(X_batch[i:i + 1]).float().to(self.device)
+        with torch.no_grad():
+            scores = np.empty(n, dtype=np.float32)
+            # Process in chunks to avoid OOM on large datasets
+            chunk_size = 256
+            for start in range(0, n, chunk_size):
+                end = min(start + chunk_size, n)
+                chunk_len = end - start
 
-            with torch.no_grad():
-                score_a_x = self.model(X_train_a.to(self.device), X_i.repeat(num, 1))
-                score_x_u = self.model(X_i.repeat(num, 1), X_train_u.to(self.device))
+                X_i = X_batch_tensor[start:end]  # (chunk_len, d)
+                X_i_rep = X_i.unsqueeze(1).expand(-1, num, -1).reshape(chunk_len * num, -1)
 
-            score_sub = torch.mean(score_a_x + score_x_u).cpu().numpy()
-            scores.append(score_sub)
+                X_a = self.X_train_tensor[index_a[start:end].ravel()].to(self.device)
+                X_u = self.X_train_tensor[index_u[start:end].ravel()].to(self.device)
 
-        scores = np.array(scores)
+                score_a_x = self.model(X_a, X_i_rep).reshape(chunk_len, num)
+                score_x_u = self.model(X_i_rep, X_u).reshape(chunk_len, num)
+                scores[start:end] = (score_a_x + score_x_u).mean(dim=1).cpu().numpy()
 
         s_min, s_max = scores.min(), scores.max()
         if s_max - s_min > 1e-8:
@@ -281,7 +278,7 @@ class XGBODWrapper(Model):
     def train(self, epochs: int = 1) -> None:
         if self.detector is None:
             self._build_detector()
-        y_train = self.y_train.copy()
+        y_train = self.y_train
 
         for _ in range(epochs):
             self.detector.fit(self.X_train, y_train)
@@ -395,12 +392,16 @@ class DeepSADWrapper(Model):
         self._fitted = True
 
     def train(self, epochs: int = 1) -> None:
-        y_train = self.y_train.copy()
+        y_train = self.y_train
 
-        self.dataset = load_dataset(
-            data={"X_train": self.X_train, "y_train": y_train},
-            train=True,
-        )
+        # Only rebuild dataset when labels actually change
+        y_hash = hash(y_train.tobytes())
+        if not hasattr(self, '_last_y_hash') or self._last_y_hash != y_hash:
+            self.dataset = load_dataset(
+                data={"X_train": self.X_train, "y_train": y_train},
+                train=True,
+            )
+            self._last_y_hash = y_hash
 
         if self.trainer is None:
             self.trainer = DeepSADTrainer(
@@ -440,12 +441,16 @@ class DeepSADWrapper(Model):
         X_data = self.X_train if use_train else self.X_test
         X_batch = X_data if indexes is None else X_data[indexes]
 
-        test_dataset = load_dataset(
-            data={"X_test": X_batch, "y_test": np.zeros(len(X_batch))},
-            train=False,
-        )
+        # Cache test dataset by data identity to avoid rebuild on repeated calls
+        x_id = id(X_batch)
+        if not hasattr(self, '_test_ds_cache_id') or self._test_ds_cache_id != x_id:
+            self._test_ds_cache = load_dataset(
+                data={"X_test": X_batch, "y_test": np.zeros(len(X_batch))},
+                train=False,
+            )
+            self._test_ds_cache_id = x_id
 
-        scores = self.deepsad.test(test_dataset, device=self.device, n_jobs_dataloader=0)
+        scores = self.deepsad.test(self._test_ds_cache, device=self.device, n_jobs_dataloader=0)
 
         s_min, s_max = scores.min(), scores.max()
         if s_max - s_min > 1e-8:
@@ -600,7 +605,7 @@ class DevNetWrapper(Model):
         self._fitted = True
 
     def train(self, epochs: int = 1) -> None:
-        y_train = self.y_train.copy()
+        y_train = self.y_train
 
         self.outlier_indices = np.where(y_train == 1)[0]
         self.inlier_indices = np.where(y_train == 0)[0]

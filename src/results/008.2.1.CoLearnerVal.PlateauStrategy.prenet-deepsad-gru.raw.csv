@@ -1,0 +1,20 @@
+#META:{"test_id": 8, "dataset": "annthyroid", "dataset_path": "/home/peppino58/CoBench/SubModules/ADBench/adbench/datasets/Classical/2_annthyroid.npz", "n_trials": 3, "seeds": [58, 59, 60], "models": ["prenet", "deepsad"], "n_models": 2, "has_recurrent": true, "recurrent_model": "gru", "colearner": "CoLearnerVal", "strategy": "PlateauStrategy", "warmup_epochs": 20, "max_chapters": 15, "epochs_per_chapter": 3, "gru_start_chapter": 3, "train_split": 0.6, "val_test_split": 0.5, "semi_label_ratio": 0.1, "timestamp": "2026-02-25T15:41:19.223632"}
+trial,seed,method,auc,ap
+0,58,solo_prenet,0.816849,0.451110
+0,58,solo_deepsad,0.901634,0.675731
+0,58,collab_prenet,0.806059,0.437809
+0,58,collab_deepsad,0.889919,0.663541
+0,58,collab_ensemble,0.840049,0.531271
+0,58,gru_judge,0.807062,0.458999
+1,59,solo_prenet,0.848876,0.521389
+1,59,solo_deepsad,0.941548,0.768883
+1,59,collab_prenet,0.832281,0.497234
+1,59,collab_deepsad,0.904908,0.637812
+1,59,collab_ensemble,0.877670,0.593719
+1,59,gru_judge,0.864567,0.557301
+2,60,solo_prenet,0.819990,0.435920
+2,60,solo_deepsad,0.921441,0.576107
+2,60,collab_prenet,0.778884,0.375064
+2,60,collab_deepsad,0.900337,0.522188
+2,60,collab_ensemble,0.894665,0.568104
+2,60,gru_judge,0.793102,0.382024

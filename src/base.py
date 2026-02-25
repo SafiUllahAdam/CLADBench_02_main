@@ -42,6 +42,7 @@ class Model(ABC):
         self._current_epoch = 0
         self._pseudo_labels = None
         self._pseudo_label_meta: Optional[Dict[int, PseudoLabelProposal]] = None  # idx → winning proposal
+        self._y_train_cache: Optional[np.ndarray] = None
         
         # Per-model default transfer thresholds (fallback before CoLearner defaults)
         self.default_confidence_high: Optional[float] = None
@@ -86,32 +87,40 @@ class Model(ABC):
             
     @property
     def y_train(self) -> np.ndarray:
-        """Training labels: pseudo_labels → resolved semisupervised_labels → original."""
+        """Cached training labels: pseudo_labels → resolved semisupervised_labels → original. Read-only."""
+        if self._y_train_cache is not None:
+            return self._y_train_cache
+
         if self.data is not None and hasattr(self.data, 'resolve_labels'):
             base_labels = self.data.resolve_labels()
         elif self.data is not None and getattr(self.data, 'semisupervised_labels', None) is not None:
-            base_labels = self.data.semisupervised_labels
+            base_labels = self.data.semisupervised_labels.copy()
         else:
-            base_labels = self.y_train_original
+            base_labels = self.y_train_original.copy() if self.y_train_original is not None else None
 
-        if self._pseudo_labels is None:
-            return base_labels
+        if base_labels is None:
+            return None
 
-        merged = base_labels.copy()
-        mask = self._pseudo_labels != -1
-        if self.data is not None and getattr(self.data, 'preserve_labeled', False):
-            labeled_idx = getattr(self.data, 'labeled_indexes', None)
-            if labeled_idx is not None and len(labeled_idx) > 0:
-                mask[labeled_idx] = False
-        merged[mask] = self._pseudo_labels[mask]
-        return merged
+        if self._pseudo_labels is not None:
+            mask = self._pseudo_labels != -1
+            if self.data is not None and getattr(self.data, 'preserve_labeled', False):
+                labeled_idx = getattr(self.data, 'labeled_indexes', None)
+                if labeled_idx is not None and len(labeled_idx) > 0:
+                    mask[labeled_idx] = False
+            base_labels[mask] = self._pseudo_labels[mask]
+
+        base_labels.flags.writeable = False
+        self._y_train_cache = base_labels
+        return self._y_train_cache
     
     def set_pseudo_labels(self, labels: np.ndarray) -> None:
         self._pseudo_labels = labels.copy()
+        self._y_train_cache = None  # invalidate
     
     def clear_pseudo_labels(self) -> None:
         self._pseudo_labels = None
         self._pseudo_label_meta = None
+        self._y_train_cache = None  # invalidate
     
     @abstractmethod
     def train(self, epochs: int = 1) -> None:
@@ -148,7 +157,7 @@ class RecurrentModel(ABC):
     def predict_scores(self, aggregated_embeddings: np.ndarray) -> np.ndarray:
         pass
 
-    def get_loss(self, use_val : bool = False) -> Optional[float]:
+    def get_loss(self, aggregated_embeddings: np.ndarray, labels: np.ndarray) -> Optional[float]:
         return None
 
 
@@ -158,7 +167,7 @@ class Data(ABC):
     def __init__(self, dataset, train_test_split: float = 0.8, random_state: int = 42, 
                  preserve_labeled: bool = False, data_type: str = "tabular", 
                  val_test_split: float = 0.0,
-                 labeled_ratio: Optional[float] = None, stratified: bool = True,
+                 labeled_ratio: float = 0.1, stratified: bool = True,
                  max_anomalies: Optional[int] = None, anomaly_ratio: Optional[float] = None,
                  unlabeled_policy: str = "unlabeled_as_normal"):
         self.dataset = dataset
@@ -186,36 +195,27 @@ class Data(ABC):
         self.pseudo_label_confidence: Dict[str, np.ndarray] = {}
         self.y_train_original = None
         
-        
-        self.load_and_split()
-        if labeled_ratio is not None:
-            self.generate_semisupervised_split(
-                labeled_ratio=labeled_ratio, stratified=stratified,
-                max_anomalies=max_anomalies, anomaly_ratio=anomaly_ratio,
-                unlabeled_policy=unlabeled_policy)
+        # Load data (subclass) then partition train into labeled/unlabeled
+        self._load()
+        self._init_semisupervised(labeled_ratio, stratified, max_anomalies, anomaly_ratio)
     
     @abstractmethod
-    def load_and_split(self) -> None:
+    def _load(self) -> None:
         """Load data and create train/test/val splits. Must set X_train, X_test, y_test, y_train_original, n_train, n_test."""
         pass
     
-    def generate_semisupervised_split(self,
-                                      labeled_ratio: float = 0.1, stratified: bool = True,
-                                      max_anomalies: Optional[int] = None,
-                                      anomaly_ratio: Optional[float] = None,
-                                      unlabeled_policy: str = "unlabeled_as_normal") -> None:
+    def _init_semisupervised(self, labeled_ratio: float, stratified: bool,
+                             max_anomalies: Optional[int], anomaly_ratio: Optional[float]) -> None:
+        """Partition train set into labeled/unlabeled for semi-supervised learning."""
         if self.y_train_original is None:
-            raise ValueError("load_and_split() must set y_train_original first")
-        if unlabeled_policy not in UNLABELED_POLICIES:
-            raise ValueError(f"Unknown policy '{unlabeled_policy}', choose from {UNLABELED_POLICIES}")
-    
-        seed = self.random_state
-        self.unlabeled_policy = unlabeled_policy
+            raise ValueError("_load() must set y_train_original first")
+        if self.unlabeled_policy not in UNLABELED_POLICIES:
+            raise ValueError(f"Unknown policy '{self.unlabeled_policy}', choose from {UNLABELED_POLICIES}")
     
         from sklearn.model_selection import train_test_split
         
         self.labeled_ratio = labeled_ratio
-        rng = np.random.RandomState(seed)
+        rng = np.random.RandomState(self.random_state)
         normal_idx = np.where(self.y_train_original == 0)[0]
         anomaly_idx = np.where(self.y_train_original == 1)[0]
         
@@ -231,7 +231,7 @@ class Data(ABC):
             n_labeled = max(2, int(self.n_train * labeled_ratio))
             self.labeled_indexes, self.unlabeled_indexes = train_test_split(
                 np.arange(self.n_train), train_size=n_labeled,
-                stratify=self.y_train_original if stratified else None, random_state=seed)
+                stratify=self.y_train_original if stratified else None, random_state=self.random_state)
             self.labeled_indexes = np.sort(self.labeled_indexes)
             self.unlabeled_indexes = np.sort(self.unlabeled_indexes)
     
@@ -255,7 +255,7 @@ class Data(ABC):
         n_anom = np.sum(self.y_train_original[self.labeled_indexes] == 1)
         n_norm = np.sum(self.y_train_original[self.labeled_indexes] == 0)
         logger.info(f"[Semi-supervised] Labeled: {len(self.labeled_indexes)} ({n_norm} normal, {n_anom} anomaly), "
-                    f"Unlabeled: {len(self.unlabeled_indexes)}, Policy: {unlabeled_policy}")
+                    f"Unlabeled: {len(self.unlabeled_indexes)}, Policy: {self.unlabeled_policy}")
 
     def resolve_labels(self, policy: str = None) -> np.ndarray:
         """Return training labels with unlabeled (-1) resolved per policy."""
@@ -361,6 +361,7 @@ class CoLearning(ABC):
                     best = max(proposals, key=lambda p: p.confidence)
                     resolved_meta[idx] = best
             receiver._pseudo_label_meta = resolved_meta
+            receiver._y_train_cache = None  # invalidate after direct write
 
     def send_anomalies(self, sender_idx: int, receiver_idx: int,
                        indexes: np.ndarray, scores: np.ndarray) -> int:

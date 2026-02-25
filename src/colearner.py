@@ -37,7 +37,7 @@ class SimpleCoLearner(CoLearning):
 
         exchange_indexes = self.data.unlabeled_indexes if self.keep_truth else np.arange(self.data.n_train)
         if self.keep_truth and (exchange_indexes is None or len(exchange_indexes) == 0):
-            logger.warning("[Exchange] No unlabeled_indexes set - call generate_semisupervised_split() first")
+            logger.warning("[Exchange] No unlabeled_indexes set - check Data labeled_ratio")
             return
 
         n_models = len(self.models)
@@ -202,14 +202,15 @@ class RecurrentCoLearner(SimpleCoLearner):
 
         return labels if indexes is None else labels[indexes]
 
-    def _collect_embeddings(self, indexes: Optional[np.ndarray]) -> np.ndarray:
+    def _collect_embeddings(self, indexes: Optional[np.ndarray], use_train: Optional[bool] = None) -> np.ndarray:
         # Collect one embedding view per detector model
+        use_train = self.embeddings_use_train if use_train is None else use_train
         embeddings = []
         for model in self.models:
             emb = extract_embeddings_auto(
                 model,
                 indexes=indexes,
-                use_train=self.embeddings_use_train,
+                use_train=use_train,
                 layer=self.embeddings_layer,
                 batch_size=self.embeddings_batch_size,
             )
@@ -248,15 +249,51 @@ class RecurrentCoLearner(SimpleCoLearner):
         raise ValueError(f"Unsupported embeddings_aggregate: {self.embeddings_aggregate}")
 
     def _train_recurrent(self, chapter: int) -> None:
-        # Build recurrent inputs from current collaborative state
+        # Train recurrent model epoch-by-epoch; embed once, cache for val loss
         indexes = self._get_embedding_indexes()
         labels = self._resolve_recurrent_labels(indexes)
         if labels is None:
             logger.warning("[Recurrent] Labels not available; skipping recurrent training.")
             return
         aggregated_embeddings = self._collect_embeddings(indexes)
+        val_emb = self._collect_val_embeddings()  # cache once per chapter
         n_epochs = getattr(self.recurrent_model, "num_epochs", 1)
-        self.recurrent_model.train(aggregated_embeddings, labels, n_epochs)
+        for _ in range(n_epochs):
+            self.recurrent_model.train(aggregated_embeddings, labels, epochs=1)
+            self._compute_recurrent_val_loss_cached(val_emb)
+
+    def _collect_val_embeddings(self) -> Optional[np.ndarray]:
+        # Extract fresh val embeddings by temporarily swapping test → val in each model
+        if self.data.X_val is None or self.data.y_val is None:
+            return None
+        saved = []
+        for m in self.models:
+            saved.append((getattr(m, "X_test", None), getattr(m, "y_test", None)))
+            m.X_test, m.y_test = m.X_val, self.data.y_val
+        try:
+            return self._collect_embeddings(indexes=None, use_train=False)
+        finally:
+            for m, (xt, yt) in zip(self.models, saved):
+                m.X_test, m.y_test = xt, yt
+
+    def _compute_recurrent_val_loss(self) -> None:
+        # Compute val loss with fresh embeddings and append to recurrent model history
+        if not getattr(self.recurrent_model, "_fitted", False):
+            return
+        val_emb = self._collect_val_embeddings()
+        if val_emb is None:
+            return
+        val_loss = self.recurrent_model.get_loss(val_emb, self.data.y_val)
+        if val_loss is not None:
+            self.recurrent_model._val_loss_history.append(val_loss)
+
+    def _compute_recurrent_val_loss_cached(self, val_emb: Optional[np.ndarray]) -> None:
+        # Reuse pre-collected val embeddings to avoid redundant extraction
+        if not getattr(self.recurrent_model, "_fitted", False) or val_emb is None:
+            return
+        val_loss = self.recurrent_model.get_loss(val_emb, self.data.y_val)
+        if val_loss is not None:
+            self.recurrent_model._val_loss_history.append(val_loss)
 
     def cotrain(self, eval_interval: int = 1) -> Dict[str, List[float]]:
         history = {"warmup": [], "chapters": []}
@@ -279,7 +316,11 @@ class RecurrentCoLearner(SimpleCoLearner):
 
 
 class DelayedRecurrentCoLearner(RecurrentCoLearner):
-    """Recurrent co-learner that delays recurrent training until later chapters."""
+    """Recurrent co-learner that delays recurrent training until later chapters.
+
+    Uses validation-based early stopping (like CoLearnerVal) to avoid test leakage.
+    Supports epochs_per_chapter for parity with CoLearnerVal.
+    """
 
     def __init__(
         self,
@@ -288,6 +329,7 @@ class DelayedRecurrentCoLearner(RecurrentCoLearner):
         strategy: Strategy,
         recurrent_model: RecurrentModel,
         recurrent_start_chapter: int = 3,
+        epochs_per_chapter: int = 1,
         **kwargs,
     ):
         super().__init__(
@@ -298,33 +340,67 @@ class DelayedRecurrentCoLearner(RecurrentCoLearner):
             **kwargs,
         )
         self.recurrent_start_chapter = recurrent_start_chapter
+        self.epochs_per_chapter = epochs_per_chapter
+        self.val_loss_history = {i: [] for i in range(len(models))}
 
-    def _evaluate_with_gru(self, y_true: np.ndarray, chapter: int) -> Dict[str, float]:
-        """Evaluate detectors + GRU judge (only after recurrent training starts)."""
-        metrics = self._evaluate(y_true)
-        if chapter >= self.recurrent_start_chapter and self.recurrent_model._fitted:
-            self.embeddings_use_train = False
+    def _evaluate_with_gru(self, y_val: np.ndarray, chapter: int) -> Dict[str, float]:
+        """Evaluate detectors + GRU judge on validation set."""
+        val_scores_list = []
+        metrics = {}
+        for i, model in enumerate(self.models):
+            sc = _predict_scores_on_val(model, self.data)
+            val_scores_list.append(sc)
             try:
-                test_emb = self._collect_embeddings(indexes=None)
-                gru_scores = self.recurrent_model.predict_scores(test_emb)
-                metrics["gru"] = roc_auc_score(y_true, gru_scores)
-            except Exception:
-                metrics["gru"] = 0.5
-            finally:
-                self.embeddings_use_train = True
+                metrics[f"model_{i}"] = _compute_auc_or_raise(y_val, sc)
+            except ValueError:
+                metrics[f"model_{i}"] = 0.5
+        try:
+            metrics["ensemble"] = _compute_auc_or_raise(
+                y_val, np.mean(val_scores_list, axis=0))
+        except ValueError:
+            metrics["ensemble"] = 0.5
+        if chapter >= self.recurrent_start_chapter and self.recurrent_model._fitted:
+            val_emb = self._collect_val_embeddings()
+            if val_emb is not None:
+                try:
+                    gru_scores = self.recurrent_model.predict_scores(val_emb)
+                    metrics["gru"] = roc_auc_score(y_val, gru_scores)
+                except Exception:
+                    metrics["gru"] = 0.5
         return metrics
 
     def cotrain(self, eval_interval: int = 1) -> Dict[str, List[float]]:
         history = {"warmup": [], "chapters": []}
-        self._warmup()
-        logger.info(f"[Collaborative] Running up to {self.max_chapters} chapters...")
-        for chapter in range(self.max_chapters):
-            self.exchange()
+        y_val = self.data.y_val
+        if y_val is None or len(y_val) == 0:
+            raise ValueError("Validation set required for DelayedRecurrentCoLearner.")
+
+        # Warmup with val loss tracking
+        logger.info(f"[Warmup] Training {len(self.models)} models for {self.warmup_epochs} epochs...")
+        for epoch in range(self.warmup_epochs):
             for model in self.models:
                 model.train(1)
+            for i, model in enumerate(self.models):
+                val_loss = _compute_val_loss(model, self.data)
+                if val_loss is not None:
+                    self.val_loss_history[i].append(val_loss)
+            if (epoch + 1) % max(1, self.warmup_epochs // 3) == 0:
+                logger.info(f"  Epoch {epoch + 1}/{self.warmup_epochs}")
+
+        logger.info(f"[Collaborative] Running up to {self.max_chapters} chapters "
+                    f"({self.epochs_per_chapter} epochs/chapter)...")
+        for chapter in range(self.max_chapters):
+            self.exchange()
+            for ep in range(self.epochs_per_chapter):
+                for model in self.models:
+                    model.train(1)
+                for i, model in enumerate(self.models):
+                    val_loss = _compute_val_loss(model, self.data)
+                    if val_loss is not None:
+                        self.val_loss_history[i].append(val_loss)
             if chapter >= self.recurrent_start_chapter:
                 self._train_recurrent(chapter)
-            metrics = self._evaluate_with_gru(self.data.y_test, chapter)
+            metrics = self._evaluate_with_gru(y_val, chapter)
             if (chapter + 1) % eval_interval == 0:
                 self._log(chapter, metrics)
             history["chapters"].append(metrics)
@@ -392,14 +468,12 @@ def _predict_scores_on_val(model, data):
     return scores
 
 def _compute_val_loss(model, data):
-    """Compute validation loss for a model using its get_loss method."""
+    """Compute validation loss; returns None if unavailable."""
     if hasattr(model, "get_loss"):
         loss = model.get_loss(use_val=True)
         if loss is not None:
             return loss
-
-    logger.warning("Model does not have get_loss method or it returned None. Returning 0.0 as default.")
-    return 0.0
+    return None
 
 
 
@@ -424,10 +498,10 @@ class CoLearnerVal(SimpleCoLearner):
         for epoch in range(self.warmup_epochs):
             for model in self.models:
                 model.train(1)
-            # Compute validation loss after each warmup epoch
             for i, model in enumerate(self.models):
                 val_loss = _compute_val_loss(model, self.data)
-                self.val_loss_history[i].append(val_loss)
+                if val_loss is not None:
+                    self.val_loss_history[i].append(val_loss)
             if (epoch + 1) % max(1, self.warmup_epochs // 3) == 0:
                 logger.info(f"  Epoch {epoch + 1}/{self.warmup_epochs}")
 
@@ -435,14 +509,13 @@ class CoLearnerVal(SimpleCoLearner):
         for chapter in range(self.max_chapters):
             self.exchange()
             
-            # Train multiple epochs per chapter
             for ep in range(self.epochs_per_chapter):
                 for model in self.models:
                     model.train(1)
-                # Compute validation loss after each epoch
                 for i, model in enumerate(self.models):
                     val_loss = _compute_val_loss(model, self.data)
-                    self.val_loss_history[i].append(val_loss)
+                    if val_loss is not None:
+                        self.val_loss_history[i].append(val_loss)
 
             val_scores_list = []
             model_metrics = {}

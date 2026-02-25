@@ -41,7 +41,7 @@ class ClassicalADBenchData(Data):
             normalize: Whether to apply MinMaxScaler (default True)
             preserve_labeled: If True, preserve ground-truth labels on labeled_indexes
             data_type: Type of data (default "tabular")
-            labeled_ratio: If set, auto-call generate_semisupervised_split after loading
+            labeled_ratio: Fraction of train set with visible labels (default 0.1)
             stratified: Stratified semi-supervised split (default True)
             max_anomalies: Cap on visible anomalies in semi-supervised split
             anomaly_ratio: Fraction of anomalies visible in semi-supervised split
@@ -61,7 +61,7 @@ class ClassicalADBenchData(Data):
         # Load raw data
         self._raw_data = np.load(self.dataset_path, allow_pickle=True)
         
-        # Initialize parent (auto-calls load_and_split + optional generate_semisupervised_split)
+        # Parent __init__ calls _load() then _label_split()
         super().__init__(
             dataset=self._raw_data,
             train_test_split=train_test_split_ratio,
@@ -92,20 +92,8 @@ class ClassicalADBenchData(Data):
         self.n_samples = n_total
         self.global_indexes = np.arange(self.n_samples)
     
-    def load_and_split(self) -> None:
-        """
-        Load data and create train/test/validation splits.
-        
-        Required by abstract base class Data.
-        
-        Flow:
-        1. Load data (handle pre-split or unsplit format)
-        2. Split into train and (test+val) using train_test_split_ratio
-        3. If val_test_split_ratio > 0: split (test+val) into test and val
-           Else: all goes to test, val remains empty
-        4. Normalize all splits using same scaler fit on training data
-        5. Cache data and set indexes
-        """
+    def _load(self) -> None:
+        """Load NPZ data and create train/test/val splits with optional normalization."""
         from sklearn.model_selection import train_test_split as sklearn_train_test_split
         
         data = self._raw_data

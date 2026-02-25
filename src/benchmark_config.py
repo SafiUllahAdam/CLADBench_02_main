@@ -26,6 +26,7 @@ PROJECT_ROOT = _find_project_root()
 SRC_ROOT = PROJECT_ROOT / "src"
 ADBENCH_ROOT = PROJECT_ROOT / "SubModules" / "ADBench"
 ADBENCH_DATASETS = ADBENCH_ROOT / "adbench" / "datasets" / "Classical"
+RESULTS_DIR = SRC_ROOT / "results"
 
 # ============================================================================
 # DATASET CONFIGURATION

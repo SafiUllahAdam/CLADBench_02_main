@@ -1,36 +1,44 @@
 # AGENTS
 
-## Project summary
-CoBench is a collaborative anomaly detection benchmark. It is built for a hospital and uses standardizes datasets, model wrappers, and co-training strategies to compare solo vs collaborative performance using AUC-based metrics.
+Hospital-grade collaborative anomaly detection benchmark. Compares solo vs collaborative semi-supervised AD using AUC and AP. Test notebook: `alpha.ipynb`. Production benchmark: `complete_analysis.ipynb` (CLI-driven).
 
-Preliminary test notebook (check if compile, if the code runs): alpha.ipynb
-Real notebook (do we achieve state of the art): complete_analysis.ipynb
+Don't change API unless asked. Don't add functions unless necessary. Short clear functions, 1-line comments max. Be rigorous.
 
-## Core concepts (from base.py)
-- `Data`: unified dataset interface (train/test/val splits, labeled/unlabeled indices, semi-supervised labels, pseudo-label stores).
-- `Model`(ModelWrapperADBench.py): unified model API (`fit`, `train (epochs)`, `predict_scores`, optionnal`get_embeddings`, optional `get_loss`). Models consume `Data` and expose anomaly scores in $[0,1]$. The get_embeddings function is yet to be normalized. 
-- RecurrentModel (recurrentmodels.py): yet to be built
-- `CoLearning `(colearner.py): coordinates multi-model training with pseudo-label exchange and strategy-driven stopping (see `SimpleCoLearner`, `CoLearnerVal`). A training session has several chapters, a chapter has several epochs. At the beginning of the chapter high-confidence pseudo-labels are exchanged on the unlabled part of the training set, then each model trains a few epochs.
-- `Strategy`(strategy.py): controls convergence based on metrics (e.g., plateau strategies).
-Don't change API unless asked
-Don't add functions unless necessary
-Write short and clear functions, comments are 1 line max
+## Quality guidelines :
+- The main benchmark should only call functions defined in base.py
+- If a researcher wants to work on my benchmark and add custom code, they only need to write a new class with the abstract classes written in base.py, always ask yourself if the code you're building may impact the first two mentioned points
+- A-rank open source research paper quality code
+- ideal scenario : main.py only calls functions defined in abstract classes in base.py
 
-The complete_analysis notebook is a base for the benchmark that shall be used through CLI 
+## Core classes
+- `Data` (base.py): train/val/test splits, labeled/unlabeled indices, semi-supervised labels, pseudo-label store.
+- `Model` (ModelWrapperADBench.py): `fit()`, `train(epochs)`, `predict_scores()`, optional `get_embeddings()`, `get_loss()`. Scores in $[0,1]$. Exposes `_train_loss_history`, `_val_loss_history`.
+- `GRURecurrentModel` (recurrentmodels.py): judge model on stacked detector embeddings. API: `train(embeddings, labels, epochs)`, `predict_scores(embeddings)`, `get_loss(embeddings, labels)`, loss histories. Val loss computed by colearner via `_compute_recurrent_val_loss()`.
+- `CoLearnerVal` (colearner.py): chapters × epochs loop; exchanges high-confidence pseudo-labels on unlabeled split at each chapter start.
+- `DelayedRecurrentCoLearner` (colearner.py): extends `CoLearnerVal`; activates GRU after `recurrent_start_chapter`. Uses `embeddings_aggregate="stack"`. Exposes `_collect_embeddings(indexes)`.
+- `Strategy` (strategy.py): `PlateauStrategy`, `AdaptivePlateauStrategy`, `RecurrentPlateauStrategy` (monitors `fallback_key` then switches to `recurrent_key` once GRU starts).
+- `benchmark_config.py`: all path/config constants (`PROJECT_ROOT`, `DATASET_CONFIG`, etc.).
+- `utils.py`: `create_models`, `validate_data`, `extract_embeddings_auto`.
 
-Be rigorous and double check the logic of the code
-
-## Benchmark flow (from complete_analysis.ipynb)
-1) **EVAL 1**: Train solo baselines per dataset; report test AUC.
-2) **EVAL 2**: Train collaborative learners; compare against solo AUC and report deltas.
-3) **EVAL 2b**: Inspect training dynamics (losses, exchange precision, per-chapter validation AUC).
-4) **EVAL 3**: Train collaborative learners; add the collaborative ensemble learning. 
+## alpha.ipynb flow
+1. Setup: seeds, paths/config imports, benchmark classes, and split/semi-supervised knobs.
+2. Data init + checks: build `ClassicalADBenchData`, run `validate_data`, print labeled/unlabeled stats.
+3. Model selection: define detector list (`prenet`, `deepsad`) and recurrent model (`gru`).
+4. TEST 1 (solo sanity): train one detector for a few epochs, report test ROC-AUC (+ loss when available).
+5. TEST 2 (collab sanity): solo baselines vs `CoLearnerVal` + `PlateauStrategy`; run co-training and print per-model/ensemble AUC deltas.
+6. TEST 3 (pseudo-label audit): print pseudo-label counts and proportions per detector.
+7. Recurrent judge test: run `DelayedRecurrentCoLearner` + `GRURecurrentModel` + `RecurrentPlateauStrategy`, then evaluate GRU test AUC.
+8. Quick visuals: chapter AUC curves, solo-vs-collab bars, and loss mosaic across experiments.
+9. Cross-validation benchmark: run `N_TRIALS` seeds; store solo/collab/GRU AUC, AP, losses, and per-chapter histories in `cv_results`.
+10. CV publication plots: (a) loss ribbons, (b) chapter AUC + ΔAUC dynamics, (c) final test AUC/AP bars with IQR + trial scatter.
+11. Export artifacts: save summary CSV + raw per-trial CSV in `src/results/` with encoded filename metadata.
+12. Save figures: write dynamics/bar/loss PNGs using the same results stem.
 
 ## Metrics
-- Primary: ROC-AUC on test set (solo vs collaborative).
-- Validation AUC is used for per-chapter monitoring in `CoLearnerVal`.
-- Exchange precision tracks pseudo-label quality on unlabeled samples.
+- Test: ROC-AUC and AP, solo vs collaborative vs collaborative + Recurrent judge.
+- Validation AUC for per-chapter monitoring; exchange precision for pseudo-label quality.
+- CV: mean ± std over N_TRIALS, collab − solo deltas per model.
 
-## Notes for agents
-- Use the `Model` API to keep wrappers consistent.
-- Prefer validation splits for early stopping/strategy decisions.
+## Agent notes
+- GRU embeddings: pad to same dim, stack axis=1 → shape `(n_samples, n_detectors, dim)`.
+- `RecurrentPlateauStrategy.recurrent_start_chapter` must match `DelayedRecurrentCoLearner.recurrent_start_chapter`.
