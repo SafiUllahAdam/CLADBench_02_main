@@ -5,8 +5,8 @@ Hospital-grade collaborative anomaly detection benchmark. Compares solo vs colla
 Don't change API unless asked. Don't add functions unless necessary. Short clear functions, 1-line comments max. Be rigorous.
 
 ## Quality guidelines :
-- The main benchmark should only call functions defined in base.py
-- If a researcher wants to work on my benchmark and add custom code, they only need to write a new class with the abstract classes written in base.py, always ask yourself if the code you're building may impact the first two mentioned points
+- The main benchmark should preferably only call functions defined in base.py
+- If a researcher wants to work on my benchmark and add custom code (model, recurrent model, data, colearning strategy), they only need to write a new class with the abstract classes written in base.py, always ask yourself if the code you're building may impact the first two mentioned points
 - A-rank open source research paper quality code
 - ideal scenario : main.py only calls functions defined in abstract classes in base.py
 

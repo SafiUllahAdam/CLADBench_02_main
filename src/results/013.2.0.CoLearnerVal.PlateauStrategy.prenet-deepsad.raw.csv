@@ -1,0 +1,7 @@
+#META:{"test_id": 13, "dataset": "annthyroid", "dataset_path": "/home/peppino58/CoBench/SubModules/ADBench/adbench/datasets/Classical/2_annthyroid.npz", "n_trials": 1, "seeds": [58], "models": ["prenet", "deepsad"], "n_models": 2, "has_recurrent": false, "recurrent_model": "none", "colearner": "CoLearnerVal", "strategy": "PlateauStrategy", "warmup_epochs": 2, "max_chapters": 2, "epochs_per_chapter": 3, "gru_start_chapter": null, "train_split": 0.6, "val_test_split": 0.5, "semi_label_ratio": 0.1, "timestamp": "2026-02-26T18:33:18.033769"}
+trial,seed,method,auc,ap
+0,58,solo_prenet,0.816849,0.451110
+0,58,solo_deepsad,0.901634,0.675731
+0,58,collab_prenet,0.739054,0.342532
+0,58,collab_deepsad,0.795823,0.417034
+0,58,collab_ensemble,0.805954,0.448918
