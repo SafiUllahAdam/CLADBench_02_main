@@ -197,7 +197,6 @@ class RecurrentCoLearner(SimpleCoLearner):
         return labels if indexes is None else labels[indexes]
 
     def _collect_embeddings(self, indexes: Optional[np.ndarray],
-    def _collect_embeddings(self, indexes: Optional[np.ndarray],
                             use_train: Optional[bool] = None, use_val: bool = False) -> np.ndarray:
         use_train = self.embeddings_use_train if use_train is None else use_train
         embeddings = []
