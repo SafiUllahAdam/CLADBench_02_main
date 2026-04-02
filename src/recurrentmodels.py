@@ -8,7 +8,7 @@ from base import RecurrentModel
 
 
 class GRURecurrentModel(RecurrentModel):
-    """GRU judge over stacked detector embeddings."""
+    """GRU that scores anomalies from stacked detector embeddings."""
 
     def __init__(self, hidden_size: int = 128, num_layers: int = 1, dropout: float = 0.0,
                  lr: float = 1e-3, batch_size: int = 256, num_epochs: int = 50,
@@ -50,7 +50,7 @@ class GRURecurrentModel(RecurrentModel):
         self._input_size = input_size
 
     def _prepare_batch(self, embeddings: np.ndarray, labels: Optional[np.ndarray] = None):
-        # Auto-reshape 2D -> 3D for GRU input
+        # Reshape 2D to 3D if needed for GRU
         x = np.asarray(embeddings, dtype=np.float32)
         if x.ndim == 2:
             if self.n_detectors and self.n_detectors > 1:

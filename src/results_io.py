@@ -1,4 +1,4 @@
-"""CSV export for CoBench CV results."""
+"""CSV export for cross-validation results."""
 
 import csv
 import json
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 def _stats_row(label: str, values) -> Dict[str, Any]:
-    """Summary statistics for an array of scores."""
+    """Summary stats for a metric across trials."""
     v = np.array(values, dtype=float)
     return {
         "method": label, "mean": np.nanmean(v), "std": np.nanstd(v),
@@ -26,7 +26,7 @@ def _stats_row(label: str, values) -> Dict[str, Any]:
 
 
 def _next_test_id(results_dir: Path) -> int:
-    """Auto-increment test id from existing NNN.*.csv files."""
+    """Auto-increment test ID from existing CSV filenames."""
     existing = [int(m.group(1)) for f in glob.glob(str(results_dir / "*.csv"))
                 if (m := re.match(r"^(\d{3})\.", Path(f).name))]
     return max(existing, default=0) + 1
@@ -34,7 +34,7 @@ def _next_test_id(results_dir: Path) -> int:
 
 def build_filename(test_id: int, cv_results: Dict, colearner_name: str,
                    strategy_name: str, has_recurrent: bool) -> str:
-    """Encode benchmark metadata into filename."""
+    """Encode run metadata into the filename."""
     n_models = len(cv_results["model_names"])
     models_tag = "-".join(cv_results["model_names"])
     if has_recurrent:
@@ -47,7 +47,7 @@ def export_cv_results(cv_results: Dict, results_dir: Path,
                       dataset_name: str, dataset_path: str,
                       train_config: Dict, has_recurrent: Optional[bool] = None,
                       project_root: Optional[Path] = None) -> Path:
-    """Export CV results as stats CSV + raw per-trial CSV. Returns stats filepath."""
+    """Write stats CSV + raw per-trial CSV. Returns stats filepath."""
     results_dir.mkdir(parents=True, exist_ok=True)
 
     if has_recurrent is None:
@@ -57,7 +57,7 @@ def export_cv_results(cv_results: Dict, results_dir: Path,
     filename = build_filename(test_id, cv_results, colearner_name, strategy_name, has_recurrent)
     filepath = results_dir / filename
 
-    # Stats rows
+    # Build summary rows
     rows = []
     for name in cv_results["model_names"]:
         rows.append(_stats_row(f"solo_{name}_auc", cv_results["solo"][name]["auc"]))
@@ -76,7 +76,7 @@ def export_cv_results(cv_results: Dict, results_dir: Path,
         rows.append(_stats_row(f"delta_{name}_auc", da))
         rows.append(_stats_row(f"delta_{name}_ap", dp))
 
-    # Metadata
+    # Run metadata (embedded as JSON header in CSV)
     metadata = {
         "test_id": test_id, "dataset": dataset_name, "dataset_path": dataset_path,
         "n_trials": cv_results["n_trials"], "seeds": cv_results["seeds"],
@@ -94,7 +94,7 @@ def export_cv_results(cv_results: Dict, results_dir: Path,
         "timestamp": datetime.now().isoformat(),
     }
 
-    # Write stats CSV
+    # Stats CSV
     stat_cols = ["method", "mean", "std", "min", "q25", "median", "q75", "max", "n_trials"]
     with open(filepath, "w", newline="") as f:
         f.write(f"#META:{json.dumps(metadata)}\n")
@@ -104,7 +104,7 @@ def export_cv_results(cv_results: Dict, results_dir: Path,
             writer.writerow({k: f"{row[k]:.6f}" if isinstance(row[k], float) else row[k]
                              for k in stat_cols})
 
-    # Write raw per-trial CSV
+    # Raw per-trial CSV
     raw_filepath = filepath.with_suffix(".raw.csv")
     raw_cols = ["trial", "seed", "method", "auc", "ap"]
     with open(raw_filepath, "w", newline="") as f:

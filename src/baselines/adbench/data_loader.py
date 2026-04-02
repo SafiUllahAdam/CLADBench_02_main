@@ -1,23 +1,16 @@
-"""Data loaders and wrappers for ADBench Classical datasets."""
+"""ADBench data loader."""
 
 from pathlib import Path
 import numpy as np
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 
 from base import Data
 
 
 class ClassicalADBenchData(Data):
-    """
-    Data wrapper for ADBench Classical datasets (numpy arrays).
+    """Loads ADBench .npz datasets with train/val/test splitting and normalization."""
     
-    Handles data loading, train/test/val splitting, and normalization.
-    Supports both pre-split (X_train, y_train, X_test, y_test) and 
-    unsplit (X, y) NPZ formats.
-    """
-    
-    def __init__(self, 
+    def __init__(self,
                  dataset_path: Path,
                  train_test_split_ratio: float = 0.8,
                  val_test_split_ratio: float = 0.0,
@@ -30,23 +23,6 @@ class ClassicalADBenchData(Data):
                  max_anomalies=None,
                  anomaly_ratio=None,
                  unlabeled_policy: str = "unlabeled_as_normal"):
-        """
-        Initialize Classical ADBench dataset.
-        
-        Args:
-            dataset_path: Path to .npz file
-            train_test_split_ratio: Fraction for train vs test (default 0.8)
-            val_test_split_ratio: Fraction of test used for validation; 0 means no val set (default 0.0)
-            random_state: Seed for reproducibility
-            normalize: Whether to apply MinMaxScaler (default True)
-            preserve_labeled: If True, preserve ground-truth labels on labeled_indexes
-            data_type: Type of data (default "tabular")
-            labeled_ratio: Fraction of train set with visible labels (default 0.1)
-            stratified: Stratified semi-supervised split (default True)
-            max_anomalies: Cap on visible anomalies in semi-supervised split
-            anomaly_ratio: Fraction of anomalies visible in semi-supervised split
-            unlabeled_policy: How to resolve -1 labels (default "unlabeled_as_normal")
-        """
         self.dataset_path = Path(dataset_path)
         self.normalize = normalize
         self._scaler = None
@@ -77,7 +53,6 @@ class ClassicalADBenchData(Data):
         )
     
     def assign_global_indexes(self) -> None:
-        """Assign global indices based on total samples."""
         data = self._raw_data
         files = set(data.files)
         
@@ -93,15 +68,14 @@ class ClassicalADBenchData(Data):
         self.global_indexes = np.arange(self.n_samples)
     
     def _load(self) -> None:
-        """Load NPZ data and create train/test/val splits with optional normalization."""
         from sklearn.model_selection import train_test_split as sklearn_train_test_split
         
         data = self._raw_data
         files = set(data.files)
         
-        # Step 1: Load raw data
+        # Load raw arrays from NPZ
         if {"X_train", "y_train", "X_test", "y_test"}.issubset(files):
-            # Pre-split format: combine and re-split
+            # Combine pre-split data so we can re-split with our own ratio
             X_train_orig = np.asarray(data["X_train"], dtype=np.float32)
             y_train_orig = np.asarray(data["y_train"], dtype=np.int32)
             X_test_orig = np.asarray(data["X_test"], dtype=np.float32)
@@ -110,13 +84,13 @@ class ClassicalADBenchData(Data):
             X_all = np.vstack([X_train_orig, X_test_orig])
             y_all = np.hstack([y_train_orig, y_test_orig])
         elif {"X", "y"}.issubset(files):
-            # Unsplit format: use directly
+            # Already combined
             X_all = np.asarray(data["X"], dtype=np.float32)
             y_all = np.asarray(data["y"], dtype=np.int32)
         else:
             raise ValueError(f"Unexpected keys in dataset: {files}")
         
-        # Step 2: Split into train and (test+val)
+        # Train vs (test+val)
         X_train, X_test_val, y_train, y_test_val = sklearn_train_test_split(
             X_all, y_all,
             train_size=self.train_test_split,
@@ -125,7 +99,7 @@ class ClassicalADBenchData(Data):
             random_state=self.random_state
         )
         
-        # Step 3: Split (test+val) into test and val, or keep all as test if val_test_split=0
+        # Split off validation set (if requested)
         if self.val_test_split > 0:
             X_test, X_val, y_test, y_val = sklearn_train_test_split(
                 X_test_val, y_test_val,
@@ -135,11 +109,11 @@ class ClassicalADBenchData(Data):
                 random_state=self.random_state
             )
         else:
-            # No validation split: all goes to test
+            # No validation set
             X_test, X_val = X_test_val, np.empty((0, X_test_val.shape[1]), dtype=np.float32)
             y_test, y_val = y_test_val, np.empty(0, dtype=np.int32)
         
-        # Step 4: Normalize all splits with scaler fit on training data
+        # Normalize (scaler fit on train only)
         if self.normalize:
             self._scaler = MinMaxScaler()
             X_train = self._scaler.fit_transform(X_train)
@@ -147,14 +121,14 @@ class ClassicalADBenchData(Data):
             if len(X_val) > 0:
                 X_val = self._scaler.transform(X_val)
         
-        # Step 5: Store data as direct attributes (no caching indirection)
+        # Store splits
         self.X_train = X_train
         self.X_test = X_test
         self.X_val = X_val
         self.y_test = y_test
         self.y_val = y_val
         
-        # Set split info
+        # Index bookkeeping
         self.n_train = len(X_train)
         self.n_test = len(X_test)
         self.n_val = len(X_val)
@@ -165,7 +139,7 @@ class ClassicalADBenchData(Data):
         else:
             self.val_indexes = np.empty(0, dtype=int)
         
-        # Store original training labels
+        # Keep originals for evaluation
         self.y_train_original = y_train.copy()
     
     def __repr__(self) -> str:
@@ -180,22 +154,8 @@ class ClassicalADBenchData(Data):
 
 
 
-def load_data(dataset_path: Path, 
+def load_data(dataset_path: Path,
               preserve_labeled: bool = False,
               data_type: str = "tabular") -> ClassicalADBenchData:
-    """
-    Load ADBench Classical dataset from NPZ file.
-    
-    Args:
-        dataset_path: Path to .npz file
-        preserve_labeled: If True, preserve ground-truth labels on labeled_indexes
-        data_type: Type of data (default "tabular")
-    
-    Returns:
-        ClassicalADBenchData instance with X_train, X_test, X_val and y_train, y_test, y_val
-    
-    Example:
-        data = load_data(Path("SubModules/ADBench/adbench/datasets/Classical/2_annthyroid.npz"))
-        print(data.X_train.shape, data.X_test.shape)
-    """
+    """Shortcut to load an ADBench .npz dataset."""
     return ClassicalADBenchData(dataset_path, preserve_labeled=preserve_labeled, data_type=data_type)

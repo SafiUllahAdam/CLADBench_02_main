@@ -23,7 +23,7 @@ def default_arbiter(proposals: List[PseudoLabelProposal]) -> Optional[int]:
 
 
 class Model(ABC):
-    """Base anomaly detector with incremental training and pseudo-label support."""
+    """Base anomaly detector."""
 
     def __init__(self, train_config: Optional[Dict] = None,
                  model_config: Optional[Dict] = None,
@@ -37,7 +37,7 @@ class Model(ABC):
         self._pseudo_label_meta: Optional[Dict[int, PseudoLabelProposal]] = None
         self._y_train_cache: Optional[np.ndarray] = None
 
-        # Per-model transfer thresholds (fallback before CoLearner defaults)
+        # Per-model transfer thresholds
         self.default_confidence_high: Optional[float] = None
         self.default_confidence_low: Optional[float] = None
 
@@ -77,7 +77,7 @@ class Model(ABC):
 
     @property
     def y_train(self) -> np.ndarray:
-        """Resolved labels: pseudo > semisupervised > original. Cached & read-only."""
+        """Resolved labels: pseudo > semisupervised > original."""
         if self._y_train_cache is not None:
             return self._y_train_cache
 
@@ -90,7 +90,7 @@ class Model(ABC):
         if base is None:
             return None
 
-        # Overlay pseudo-labels, protecting ground-truth labeled samples
+        # Overlay pseudo-labels but keep ground-truth labels intact
         if self._pseudo_labels is not None:
             mask = self._pseudo_labels != -1
             if getattr(self.data, 'preserve_labeled', False):
@@ -121,7 +121,7 @@ class Model(ABC):
     @abstractmethod
     def predict_scores(self, indexes: Optional[np.ndarray] = None,
                        use_train: bool = False, use_val: bool = False) -> np.ndarray:
-        """Return anomaly scores in [0,1]. use_train=True scores training data; use_val=True scores validation data."""
+        """Return anomaly scores in [0,1]."""
 
     @abstractmethod
     def get_embeddings(self, indexes: Optional[np.ndarray] = None,
@@ -132,7 +132,7 @@ class Model(ABC):
 
 
 class RecurrentModel(ABC):
-    """Sequence model over aggregated detector embeddings."""
+    """Judge model over stacked detector embeddings."""
 
     @abstractmethod
     def train(self, aggregated_embeddings: np.ndarray, labels: np.ndarray,
@@ -147,7 +147,7 @@ class RecurrentModel(ABC):
 
 
 class Data(ABC):
-    """Dataset with train/val/test splits and labeled/unlabeled partitioning."""
+    """Dataset with train/val/test splits and semi-supervised partitioning."""
 
     def __init__(self, dataset, train_test_split: float = 0.8, random_state: int = 42,
                  preserve_labeled: bool = False, data_type: str = "tabular",
@@ -178,7 +178,7 @@ class Data(ABC):
 
     @abstractmethod
     def _load(self) -> None:
-        """Must set X_train, X_test, y_test, y_train_original, n_train, n_test."""
+        """Set X_train, X_test, y_test, y_train_original, n_train, n_test."""
 
     def _init_semisupervised(self, labeled_ratio: float, stratified: bool,
                              max_anomalies: Optional[int],
@@ -212,7 +212,7 @@ class Data(ABC):
 
         self.unlabeled_indexes = np.sort(np.setdiff1d(np.arange(self.n_train), self.labeled_indexes))
 
-        # Inject missing class if needed (e.g. tiny labeled set has no anomalies)
+        # Make sure both classes are represented in the labeled set
         for target, pool, name in [(1, anomaly_idx, "anomaly"), (0, normal_idx, "normal")]:
             if np.sum(self.y_train_original[self.labeled_indexes] == target) == 0 and len(pool):
                 logger.warning(f"No labeled {name}s - injecting 1")
@@ -228,7 +228,7 @@ class Data(ABC):
                     f"Unlabeled={len(self.unlabeled_indexes)}, Policy={self.unlabeled_policy}")
 
     def resolve_labels(self, policy: str = None) -> np.ndarray:
-        """Return training labels with unlabeled (-1) resolved per policy."""
+        """Return training labels with unlabeled samples resolved per policy."""
         policy = policy or self.unlabeled_policy
         labels = self.semisupervised_labels if self.semisupervised_labels is not None else self.y_train_original
         if labels is None:
@@ -253,7 +253,7 @@ class Strategy(ABC):
 
 
 class CoLearning(ABC):
-    """Multi-model collaborative AD with pseudo-label exchange."""
+    """Multi-model collaborative training with pseudo-label exchange."""
 
     def __init__(self, models: List[Model], data: Data, strategy: Optional[Strategy],
                  warmup_epochs: int = 10, max_chapters: int = 10,
@@ -275,7 +275,7 @@ class CoLearning(ABC):
         self.pseudo_label_arbiter = pseudo_label_arbiter or default_arbiter
 
     def _resolve_threshold(self, sender_idx: int, receiver_idx: int, kind: str) -> Optional[float]:
-        # Priority: pair override > sender default > colearner default
+        # Pair override > sender default > global default
         pair = (sender_idx, receiver_idx)
         if pair in self.transfer_thresholds and kind in self.transfer_thresholds[pair]:
             return self.transfer_thresholds[pair][kind]

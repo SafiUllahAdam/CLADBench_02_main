@@ -1,56 +1,85 @@
-# CoBench API Notes
+# CoBench API Reference
 
-This document is written for our dear Adam and hopefully one day those who want to extend or debug CoBench. It summarizes the global API
+Welcome Mohammed! This document should walk you through the main interfaces so you can extend or debug CoBench.
 
-## Core Interfaces (src/base.py)
+## Model (`src/base.py`)
 
-### Model (abstract)
-- `train(epoch)`: run _epoch_ training epochs (uses current pseudo-labels if present)
-- `fit()`: full training for single-model baselines.
-- `predict_scores(indexes=None, use_train=False, use_val=False)`: return anomaly scores in [0,1]; use_train=True scores training split; use_val=True scores validation split.
-- `get_embeddings(data_or_indexes=None, use_train=True)`: return embeddings for ensemble/recurrent models
-- `get_loss(use_val=False)`: **optional design rule** — return latest train or val loss if model tracks losses; used for early stopping. Return None if unavailable.
+Every detector inherits from `Model`. The key methods:
 
-### Data (abstract)
-- Provides X/Y and global indexes
-- Maintains per-model pseudo_labels_by_model and pseudo_label_confidence.
-- get_pseudo_labels(model_name): retrieve the current pseudo-label vector for a model.
-- update_pseudo_labels(model_name, indexes, labels, confidence=None): update labels at provided indices.
+| Method | Purpose |
+|---|---|
+| `train(epochs)` | Run N training epochs using current pseudo-labels |
+| `fit()` | Full standalone training (for solo baselines) |
+| `predict_scores(indexes, use_train, use_val)` | Anomaly scores in [0,1] on test/train/val |
+| `get_embeddings(indexes, use_train)` | Internal representations for the GRU judge |
+| `get_loss(use_val)` | Latest train or val loss (optional, used for early stopping) |
 
-### Strategy (abstract + SimpleStrategy)
-- should_continue(history): convergence check; SimpleStrategy uses chapter-level AUC plateau with patience
+A chapter is a training step of `epochs` epochs.
 
-### CoLearning / CoLearner
-- Warmup: optional pretraining for each model (train(epoch)).
-- exchange(): each model predicts on training data (predict_scores(use_train=True)), selects anomalies/normals via get_anomaly_indexes / get_normal_indexes, and sends pseudo-labels to peers.
-- cotrain(recurrent_model=None, eval_interval=1): main collaborative loop with history logging; evaluates ensemble and per-model AUC on test set.
+The `y_train` property automatically resolves labels: pseudo-labels > semi-supervised > original, respecting `preserve_labeled`.
 
-## Wrappers (src/baselines/adbench/ModelWrapperADBench.py)
-- PReNetWrapper, XGBODWrapper, DeepSADWrapper, DevNetWrapper
-- **Design rule for new wrappers**:
-  - `predict_scores()` must support `use_val=True` for validation scoring (required)
-  - `get_loss(use_val=True)` should be implemented for models with loss tracking (optional but recommended)
-  - Never cache predictions based on data identity in a way that breaks with use_val swaps
-- TensorFlow import is sus as of today
+## Data (`src/base.py` + `src/baselines/adbench/data_loader.py`)
 
-## Data Wrapper (src/baselines/adbench/data_loader.py)
-- ClassicalADBenchData handles .npz datasets, train/test split, normalization, and index bookkeeping.
-- Exposes X_train, X_test, y_test and caches them; train_indexes/test_indexes align with local splits.
+- `Data` is the abstract base. `ClassicalADBenchData` is the concrete implementation for ADBench `.npz` files.
+- On init: loads data, splits train/val/test, creates labeled/unlabeled partition.
+- `resolve_labels(policy)` maps unlabeled (-1) samples per policy (`unlabeled_as_normal`, `unlabeled_as_is`, `unlabeled_as_removed`).
+- Scaler is fit on train only -- no test leakage.
 
-## Pseudo-Label Flow
-1) Model scores training data (predict_scores(use_train=True)) during training phase.
-2) CoLearner computes anomaly/normal indices based on anomaly_threshold.
-3) send_anomalies / send_normals update pseudo_labels_by_model with confidence tracking.
-4) Models consume updated pseudo-labels in their train(epoch) implementations.
+## CoLearning (`src/base.py` + `src/colearner.py`)
 
-## Evaluation Path
-- Ensemble AUC: mean of model scores on test set; evaluated every chapter
-- Per-model AUC: each model’s test scores versus y_test
-- Validation AUC: scored via `predict_scores(use_val=True)` for monitoring early stopping (no test leakage)
-- RNN AUC: Recurrent judge's scores versus ensemble/mean normal model scores
-- Same goes for AP and Rec@k
+The collaboration loop lives here. Hierarchy:
+
+```
+CoLearning (abstract)
+  └── SimpleCoLearner         -- bidirectional pseudo-label exchange
+        ├── CoLearnerVal      -- adds validation-based monitoring
+        └── RecurrentCoLearner -- adds GRU judge training
+              └── DelayedRecurrentCoLearner -- delays GRU until chapter N
+  └── SingleModel             -- solo baseline (no collaboration)
+```
+
+### Pseudo-Label Flow
+1. At each chapter, each model scores the unlabeled training data (`predict_scores(use_train=True)`)
+2. High-confidence anomalies and normals are proposed to peer models
+3. When multiple senders disagree on a sample, the arbiter picks the most confident vote
+4. Models retrain on their updated pseudo-labels in the next chapter
+
+### Thresholds
+Confidence thresholds control which pseudo-labels get sent. Priority: per-pair override > per-model default > global CoLearner default.
+
+## Strategy (`src/strategy.py`)
+
+| Strategy | Behavior |
+|---|---|
+| `PlateauStrategy` | Stops when a metric plateaus for `patience` chapters |
+| `AdaptivePlateauStrategy` | Same, but patience shrinks after each stop |
+| `RecurrentPlateauStrategy` | Monitors ensemble metric before GRU starts, then switches to GRU metric |
+
+All strategies implement `should_continue(metrics, chapter)` and `reset()`.
+
+## Recurrent Judge (`src/recurrentmodels.py`)
+
+`GRURecurrentModel` takes stacked detector embeddings (shape: `[n_samples, n_detectors, emb_dim]`) and predicts anomaly scores. Trained inside `DelayedRecurrentCoLearner` after `recurrent_start_chapter`.
+
+## Model Wrappers (`src/baselines/adbench/ModelWrapperADBench.py`)
+
+Currently available: `PReNetWrapper`, `DeepSADWrapper`, `DevNetWrapper`, `XGBODWrapper`.
+
+When writing a new wrapper:
+- `predict_scores()` must support `use_val=True` for validation scoring
+- `get_loss(use_val=True)` is recommended for models with loss tracking
+- Scores must be normalized to [0, 1]
+
+## Runner (`src/runner.py`)
+
+`run_cv()` orchestrates cross-validation: for each trial it trains solo baselines, a collaborative learner, and optionally a GRU judge, collecting AUC/AP per method.
+
+## Config (`src/benchmark_config.py`)
+
+Single source of truth for paths, dataset registry, model hyperparameters, and CV defaults. Add new datasets to `EVAL_DATASETS` and new model configs to `MODEL_CONFIGS`.
 
 ## Extension Checklist
-**** Assure we get the same results as solo baslines using train_epoch
-*** Graph compatibility 
-*** More models (ADBench, GADBench, classic models)
+
+- [ ] Reproduce solo baseline AUC before adding collaboration
+- [ ] Graph model compatibility (GADBench/PyGOD wrappers)
+- [ ] More ADBench model wrappers

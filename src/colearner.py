@@ -24,7 +24,7 @@ def _compute_auc_or_raise(y_true, scores):
 
 
 def _predict_scores_on_val(model, data):
-    """Score validation set directly via use_val parameter."""
+    """Score the validation set."""
     return model.predict_scores(use_val=True)
 
 
@@ -35,7 +35,7 @@ def _compute_val_loss(model, data):
 
 
 class SimpleCoLearner(CoLearning):
-    """Collaborative learning with bidirectional pseudo-label exchange."""
+    """Collaborative learning with pseudo-label exchange between all model pairs."""
 
     def __init__(self, models: List[Model], data: Data, strategy: Strategy,
                  warmup_epochs: int = 10, max_chapters: int = 10,
@@ -147,7 +147,7 @@ class SimpleCoLearner(CoLearning):
 
 
 class RecurrentCoLearner(SimpleCoLearner):
-    """Also trains a recurrent judge on aggregated embeddings."""
+    """Adds a GRU judge trained on stacked detector embeddings."""
 
     def __init__(self, models: List[Model], data: Data, strategy: Strategy,
                  recurrent_model: RecurrentModel,
@@ -172,7 +172,7 @@ class RecurrentCoLearner(SimpleCoLearner):
         return np.arange(self.data.n_train)
 
     def _resolve_recurrent_labels(self, indexes: Optional[np.ndarray]) -> Optional[np.ndarray]:
-        """Base labels + majority-vote pseudo-labels for recurrent training."""
+        """Merge base labels with majority-vote pseudo-labels for the GRU."""
         if hasattr(self.data, 'resolve_labels'):
             labels = self.data.resolve_labels(policy="unlabeled_as_is")
         elif getattr(self.data, "semisupervised_labels", None) is not None:
@@ -280,7 +280,7 @@ class RecurrentCoLearner(SimpleCoLearner):
 
 
 class DelayedRecurrentCoLearner(RecurrentCoLearner):
-    """Delays GRU training until recurrent_start_chapter. Val-based early stopping."""
+    """Starts GRU training only after detectors have stabilized."""
 
     def __init__(self, models: List[Model], data: Data, strategy: Strategy,
                  recurrent_model: RecurrentModel, recurrent_start_chapter: int = 3,
@@ -357,7 +357,7 @@ class DelayedRecurrentCoLearner(RecurrentCoLearner):
 
 
 class SingleModel(CoLearning):
-    """Single-model baseline (no collaboration)."""
+    """Solo baseline -- trains one model without collaboration."""
 
     def __init__(self, model: Model, data: Data, strategy: Optional[Strategy] = None,
                  warmup_epochs: int = 0):
@@ -379,7 +379,7 @@ class SingleModel(CoLearning):
 
 
 class CoLearnerVal(SimpleCoLearner):
-    """SimpleCoLearner with validation-based monitoring (no test leakage)."""
+    """Collaborative learner that monitors validation AUC (no test leakage)."""
 
     def __init__(self, *args, epochs_per_chapter: int = 1, **kwargs):
         super().__init__(*args, **kwargs)

@@ -56,7 +56,7 @@ def extract_embeddings_auto(model: Model, indexes: Optional[np.ndarray] = None,
                             use_train: bool = False, use_val: bool = False,
                             layer: Optional[str] = None,
                             batch_size: int = 1024, device: Optional[str] = None) -> np.ndarray:
-    """Try get_embeddings() -> torch hook -> keras sub-model -> fall back to scores."""
+    """Get embeddings via get_embeddings(), torch hook, keras sub-model, or scores as fallback."""
     name = model.__class__.__name__
 
     try:
@@ -101,7 +101,7 @@ def _extract_torch(torch_model, X, name, layer, batch_size, device):
     if layer and layer in named:
         target = named[layer]
     else:
-        # Pick last trainable leaf, or just last leaf
+        # Use last trainable layer, or just last layer
         leaves = [m for m in named.values() if not list(m.children())]
         target = next((m for m in reversed(leaves) if any(p.requires_grad for p in m.parameters(recurse=False))), None)
         if target is None and leaves:
@@ -140,7 +140,7 @@ def _extract_keras(keras_model, X, name, layer, batch_size):
     return sub.predict(X, batch_size=batch_size, verbose=0)
 
 
-# --- Data validation ---
+# -- Data validation --
 
 def validate_splits(data: Data) -> None:
     assert data.X_train.shape[0] == data.n_train, "X_train/n_train mismatch"
@@ -155,7 +155,7 @@ def validate_splits(data: Data) -> None:
         assert np.any(data.y_train_original[data.labeled_indexes] == 1), "no labeled anomaly"
         assert np.any(data.y_train_original[data.labeled_indexes] == 0), "no labeled normal"
 
-        # 30% relative tolerance on stratification
+        # Allow up to 30% relative drift from full-dataset anomaly rate
         if len(data.labeled_indexes) > 5:
             full_rate = np.mean(data.y_train_original == 1)
             labeled_rate = np.mean(data.y_train_original[data.labeled_indexes] == 1)

@@ -1,4 +1,4 @@
-"""ADBench model wrappers for the unified Model API."""
+"""ADBench model wrappers for the CoBench Model interface."""
 
 from typing import Dict, Optional
 import logging
@@ -15,7 +15,7 @@ from adbench.baseline.DeepSAD.src.datasets.main import load_dataset
 from adbench.baseline.DeepSAD.src.deepsad import deepsad
 from adbench.baseline.DeepSAD.src.optim.DeepSAD_trainer import DeepSADTrainer
 
-# DevNet requires TensorFlow; this is checked lazily in DevNetWrapper.__init__
+# DevNet needs TensorFlow
 TF_AVAILABLE = False
 try:
     from adbench.baseline.DevNet.run import DevNet
@@ -47,7 +47,7 @@ def get_model_detector_dict() -> Dict[str, type]:
 
 
 class PReNetWrapper(Model):
-    """ADBench PReNet with epoch-level training."""
+    """PReNet pairwise-ranking anomaly detector."""
 
     def __init__(self, train_config: dict, model_config: dict, data: dict):
         defaults = {
@@ -108,7 +108,7 @@ class PReNetWrapper(Model):
                 self._val_loss_history.append(val_loss)
 
     def _compute_prenet_loss(self, X: np.ndarray, y: np.ndarray) -> float:
-        """Pairwise ranking loss: anomaly-normal pairs should outscore normal-normal."""
+        """Pairwise ranking loss."""
         self.model.eval()
         anomaly_idx = np.where(y == 1)[0]
         normal_idx = np.where(y == 0)[0]
@@ -207,7 +207,7 @@ class PReNetWrapper(Model):
 
 
 class XGBODWrapper(Model):
-    """PyOD XGBOD wrapper."""
+    """XGBOD ensemble (XGBoost + unsupervised outlier detectors)."""
 
     def __init__(self, train_config: dict, model_config: dict, data: dict):
         if not PYOD_AVAILABLE:
@@ -262,12 +262,12 @@ class XGBODWrapper(Model):
         if X_src is None:
             raise ValueError(f"No data for embeddings (use_train={use_train})")
         X_batch = X_src if indexes is None else X_src[indexes]
-        # XGBOD only exposes decision scores, no internal embeddings
+        # No internal embeddings, use decision scores
         return self.detector.model.decision_function(X_batch).astype(float).reshape(-1, 1)
 
 
 class DeepSADWrapper(Model):
-    """ADBench DeepSAD with epoch-level training."""
+    """DeepSAD hypersphere-based anomaly detector."""
 
     def __init__(self, train_config: dict, model_config: dict, data: dict):
         defaults = {
@@ -302,7 +302,7 @@ class DeepSADWrapper(Model):
         self.weight_decay = cfg["weight_decay"]
         self.lr_milestones = []
 
-        # AE pretrain is label-free; test step needs both classes for AUC
+        # Autoencoder pretraining (unsupervised)
         if cfg["pretrain"] and not self._pretrained:
             self.deepsad.pretrain(
                 self.dataset, input_size, optimizer_name="adam",
@@ -372,7 +372,7 @@ class DeepSADWrapper(Model):
             X_data = self.X_test
         X_batch = X_data if indexes is None else X_data[indexes]
 
-        # Dummy labels for dataset loader; caching via object id to avoid rebuild on data swap
+        # Cache test dataset to avoid rebuilding on repeated calls
         x_id = id(X_batch)
         if not hasattr(self, '_test_ds_cache_id') or self._test_ds_cache_id != x_id:
             self._test_ds_cache = load_dataset(
@@ -402,7 +402,7 @@ class DeepSADWrapper(Model):
             return self.deepsad.net(tensor).cpu().numpy()
 
     def _compute_deepsad_loss(self, X: np.ndarray, y: np.ndarray) -> Optional[float]:
-        """Hypersphere loss: normals minimize dist to center, anomalies maximize."""
+        """Hypersphere loss."""
         if self.trainer is None:
             return None
         self.deepsad.net.eval()
@@ -431,7 +431,7 @@ class DeepSADWrapper(Model):
 
 
 class DevNetWrapper(Model):
-    """ADBench DevNet with epoch-level training."""
+    """DevNet deviation-network anomaly detector (requires TensorFlow)."""
 
     def __init__(self, train_config: dict, model_config: dict, data: dict):
         defaults = {
@@ -446,7 +446,7 @@ class DevNetWrapper(Model):
         self.devnet.args.nb_batch = self.train_config["nb_batch"]
         self.devnet.args.epochs = 1
         self.devnet.network_depth = int(self.train_config["network_depth"])
-        # Precreate ref to avoid K.variable path (newer Keras compat)
+        # Reference distribution for deviation scoring
         self.devnet.ref = tf.Variable(
             np.random.normal(loc=0.0, scale=1.0, size=5000).astype(np.float32),
             trainable=False,
@@ -541,7 +541,7 @@ class DevNetWrapper(Model):
         return scores
 
     def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True) -> np.ndarray:
-        # DevNet has no internal embeddings; use scores
+        # No internal embeddings, use scores
         return self.predict_scores(indexes, use_train=use_train).reshape(-1, 1)
 
     def _compute_devnet_loss(self, X: np.ndarray, y: np.ndarray) -> Optional[float]:

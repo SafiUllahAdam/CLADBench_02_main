@@ -6,7 +6,7 @@ from base import Strategy
 
 
 class SimpleStrategy(Strategy):
-    """Stop when ensemble AUC plateaus."""
+    """Stop when ensemble AUC stops improving."""
 
     def __init__(self, max_chapters: int = 50, patience: int = 5,
                  patience_threshold: float = 0.001):
@@ -31,7 +31,7 @@ class SimpleStrategy(Strategy):
 
 
 class PlateauStrategy(Strategy):
-    """Early stopping when a metric plateaus for `patience` chapters."""
+    """Stop when a metric plateaus for `patience` chapters."""
 
     def __init__(self, metric_key: str = "ensemble", mode: str = "max",
                  patience: int = 5, min_delta: float = 0.001):
@@ -68,7 +68,7 @@ class PlateauStrategy(Strategy):
 
 
 class AdaptivePlateauStrategy(Strategy):
-    """Like PlateauStrategy but patience decays after each stop."""
+    """Plateau strategy where patience shrinks after each stop."""
 
     def __init__(self, metric_key: str = "ensemble", mode: str = "max",
                  patience: int = 5, min_delta: float = 0.001,
@@ -115,7 +115,7 @@ class AdaptivePlateauStrategy(Strategy):
     def reset(self) -> None:
         self.best_value = -np.inf if self.mode == "max" else np.inf
         self.patience_counter = 0
-        # patience stays decayed across resets
+        # Keep decayed patience across resets
 
     def full_reset(self) -> None:
         self.reset()
@@ -124,7 +124,7 @@ class AdaptivePlateauStrategy(Strategy):
 
 
 class RecurrentPlateauStrategy(Strategy):
-    """Two-phase plateau: monitors fallback_key before GRU starts, recurrent_key after."""
+    """Monitors ensemble before GRU starts, then switches to GRU metric."""
 
     def __init__(self, recurrent_start_chapter: int = 3,
                  fallback_key: str = "ensemble", recurrent_key: str = "gru",
