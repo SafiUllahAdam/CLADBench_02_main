@@ -8,7 +8,7 @@ from base import RecurrentModel
 
 
 class GRURecurrentModel(RecurrentModel):
-    """GRU that scores anomalies from stacked detector embeddings."""
+    """GRU that scores anomalies from stacked detector embeddings"""
 
     def __init__(self, hidden_size: int = 128, num_layers: int = 1, dropout: float = 0.0,
                  lr: float = 1e-3, batch_size: int = 256, num_epochs: int = 50,

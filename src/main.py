@@ -1,4 +1,4 @@
-"""CoBench CLI — collaborative anomaly detection benchmark."""
+"""CoBench CLI — collaborative anomaly detection benchmark"""
 import argparse, logging, sys, time
 from pathlib import Path
 

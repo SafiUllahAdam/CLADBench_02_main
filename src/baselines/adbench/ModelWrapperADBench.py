@@ -1,4 +1,4 @@
-"""ADBench model wrappers for the CoBench Model interface."""
+"""ADBench model wrappers for the CoBench Model interface"""
 
 from typing import Dict, Optional
 import logging
@@ -47,7 +47,7 @@ def get_model_detector_dict() -> Dict[str, type]:
 
 
 class PReNetWrapper(Model):
-    """PReNet pairwise-ranking anomaly detector."""
+    """PReNet pairwise-ranking anomaly detector"""
 
     def __init__(self, train_config: dict, model_config: dict, data: dict):
         defaults = {
@@ -108,7 +108,7 @@ class PReNetWrapper(Model):
                 self._val_loss_history.append(val_loss)
 
     def _compute_prenet_loss(self, X: np.ndarray, y: np.ndarray) -> float:
-        """Pairwise ranking loss."""
+        """Pairwise ranking loss"""
         self.model.eval()
         anomaly_idx = np.where(y == 1)[0]
         normal_idx = np.where(y == 0)[0]
@@ -207,7 +207,7 @@ class PReNetWrapper(Model):
 
 
 class XGBODWrapper(Model):
-    """XGBOD ensemble (XGBoost + unsupervised outlier detectors)."""
+    """XGBOD ensemble (XGBoost + unsupervised outlier detectors)"""
 
     def __init__(self, train_config: dict, model_config: dict, data: dict):
         if not PYOD_AVAILABLE:
@@ -267,7 +267,7 @@ class XGBODWrapper(Model):
 
 
 class DeepSADWrapper(Model):
-    """DeepSAD hypersphere-based anomaly detector."""
+    """DeepSAD hypersphere-based anomaly detector"""
 
     def __init__(self, train_config: dict, model_config: dict, data: dict):
         defaults = {
@@ -402,7 +402,7 @@ class DeepSADWrapper(Model):
             return self.deepsad.net(tensor).cpu().numpy()
 
     def _compute_deepsad_loss(self, X: np.ndarray, y: np.ndarray) -> Optional[float]:
-        """Hypersphere loss."""
+        """Hypersphere loss"""
         if self.trainer is None:
             return None
         self.deepsad.net.eval()
@@ -431,7 +431,7 @@ class DeepSADWrapper(Model):
 
 
 class DevNetWrapper(Model):
-    """DevNet deviation-network anomaly detector (requires TensorFlow)."""
+    """DevNet deviation-network anomaly detector (requires TensorFlow)"""
 
     def __init__(self, train_config: dict, model_config: dict, data: dict):
         defaults = {

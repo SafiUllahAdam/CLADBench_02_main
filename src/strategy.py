@@ -6,7 +6,7 @@ from base import Strategy
 
 
 class SimpleStrategy(Strategy):
-    """Stop when ensemble AUC stops improving."""
+    """Stop when ensemble AUC stops improving"""
 
     def __init__(self, max_chapters: int = 50, patience: int = 5,
                  patience_threshold: float = 0.001):
@@ -31,7 +31,7 @@ class SimpleStrategy(Strategy):
 
 
 class PlateauStrategy(Strategy):
-    """Stop when a metric plateaus for `patience` chapters."""
+    """Stop when a metric plateaus for `patience` chapters"""
 
     def __init__(self, metric_key: str = "ensemble", mode: str = "max",
                  patience: int = 5, min_delta: float = 0.001):
@@ -68,7 +68,7 @@ class PlateauStrategy(Strategy):
 
 
 class AdaptivePlateauStrategy(Strategy):
-    """Plateau strategy where patience shrinks after each stop."""
+    """Plateau strategy where patience shrinks after each stop"""
 
     def __init__(self, metric_key: str = "ensemble", mode: str = "max",
                  patience: int = 5, min_delta: float = 0.001,
@@ -124,7 +124,7 @@ class AdaptivePlateauStrategy(Strategy):
 
 
 class RecurrentPlateauStrategy(Strategy):
-    """Monitors ensemble before GRU starts, then switches to GRU metric."""
+    """Monitors ensemble before GRU starts, then switches to GRU metric"""
 
     def __init__(self, recurrent_start_chapter: int = 3,
                  fallback_key: str = "ensemble", recurrent_key: str = "gru",

@@ -23,7 +23,7 @@ def default_arbiter(proposals: List[PseudoLabelProposal]) -> Optional[int]:
 
 
 class Model(ABC):
-    """Base anomaly detector."""
+    """Base anomaly detector"""
 
     def __init__(self, train_config: Optional[Dict] = None,
                  model_config: Optional[Dict] = None,
@@ -77,7 +77,7 @@ class Model(ABC):
 
     @property
     def y_train(self) -> np.ndarray:
-        """Resolved labels: pseudo > semisupervised > original."""
+        """Resolved labels: pseudo > semisupervised > original"""
         if self._y_train_cache is not None:
             return self._y_train_cache
 
@@ -121,7 +121,7 @@ class Model(ABC):
     @abstractmethod
     def predict_scores(self, indexes: Optional[np.ndarray] = None,
                        use_train: bool = False, use_val: bool = False) -> np.ndarray:
-        """Return anomaly scores in [0,1]."""
+        """Return anomaly scores in [0,1]"""
 
     @abstractmethod
     def get_embeddings(self, indexes: Optional[np.ndarray] = None,
@@ -132,7 +132,7 @@ class Model(ABC):
 
 
 class RecurrentModel(ABC):
-    """Judge model over stacked detector embeddings."""
+    """Judge model over stacked detector embeddings"""
 
     @abstractmethod
     def train(self, aggregated_embeddings: np.ndarray, labels: np.ndarray,
@@ -147,7 +147,7 @@ class RecurrentModel(ABC):
 
 
 class Data(ABC):
-    """Dataset with train/val/test splits and semi-supervised partitioning."""
+    """Dataset with train/val/test splits and semi-supervised partitioning"""
 
     def __init__(self, dataset, train_test_split: float = 0.8, random_state: int = 42,
                  preserve_labeled: bool = False, data_type: str = "tabular",
@@ -178,7 +178,7 @@ class Data(ABC):
 
     @abstractmethod
     def _load(self) -> None:
-        """Set X_train, X_test, y_test, y_train_original, n_train, n_test."""
+        """Set X_train, X_test, y_test, y_train_original, n_train, n_test"""
 
     def _init_semisupervised(self, labeled_ratio: float, stratified: bool,
                              max_anomalies: Optional[int],
@@ -228,7 +228,7 @@ class Data(ABC):
                     f"Unlabeled={len(self.unlabeled_indexes)}, Policy={self.unlabeled_policy}")
 
     def resolve_labels(self, policy: str = None) -> np.ndarray:
-        """Return training labels with unlabeled samples resolved per policy."""
+        """Return training labels with unlabeled samples resolved per policy"""
         policy = policy or self.unlabeled_policy
         labels = self.semisupervised_labels if self.semisupervised_labels is not None else self.y_train_original
         if labels is None:
@@ -253,7 +253,7 @@ class Strategy(ABC):
 
 
 class CoLearning(ABC):
-    """Multi-model collaborative training with pseudo-label exchange."""
+    """Multi-model collaborative training with pseudo-label exchange"""
 
     def __init__(self, models: List[Model], data: Data, strategy: Optional[Strategy],
                  warmup_epochs: int = 10, max_chapters: int = 10,

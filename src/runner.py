@@ -1,4 +1,4 @@
-"""CV runner: solo baselines, collaborative training, optional GRU judge."""
+"""CV runner: solo baselines, collaborative training, optional GRU judge"""
 
 import logging
 import time

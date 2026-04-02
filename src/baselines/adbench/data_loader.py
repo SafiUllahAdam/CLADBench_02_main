@@ -1,4 +1,4 @@
-"""ADBench data loader."""
+"""ADBench data loader"""
 
 from pathlib import Path
 import numpy as np
@@ -8,7 +8,7 @@ from base import Data
 
 
 class ClassicalADBenchData(Data):
-    """Loads ADBench .npz datasets with train/val/test splitting and normalization."""
+    """Loads ADBench .npz datasets with train/val/test splitting and normalization"""
     
     def __init__(self,
                  dataset_path: Path,
@@ -157,5 +157,5 @@ class ClassicalADBenchData(Data):
 def load_data(dataset_path: Path,
               preserve_labeled: bool = False,
               data_type: str = "tabular") -> ClassicalADBenchData:
-    """Shortcut to load an ADBench .npz dataset."""
+    """Shortcut to load an ADBench .npz dataset"""
     return ClassicalADBenchData(dataset_path, preserve_labeled=preserve_labeled, data_type=data_type)

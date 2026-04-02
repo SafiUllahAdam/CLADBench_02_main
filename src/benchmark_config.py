@@ -1,4 +1,4 @@
-"""Centralized benchmark configuration — single source of truth for paths and hyperparameters."""
+"""Centralized benchmark configuration — single source of truth for paths and hyperparameters"""
 
 from typing import Dict, Any
 from pathlib import Path
