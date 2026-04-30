@@ -14,6 +14,7 @@ def _find_project_root() -> Path:
 
 PROJECT_ROOT = _find_project_root()
 SRC_ROOT = PROJECT_ROOT / "src"
+CUSTOM_DATA_ROOT = PROJECT_ROOT / "data"
 ADBENCH_ROOT = PROJECT_ROOT / "SubModules" / "ADBench"
 ADBENCH_DATASETS = ADBENCH_ROOT / "adbench" / "datasets" / "Classical"
 RESULTS_DIR = SRC_ROOT / "results"
@@ -22,7 +23,7 @@ RESULTS_DIR = SRC_ROOT / "results"
 
 DATASET_CONFIG = {
     "name": "bnp",
-    "path": ADBENCH_DATASETS / "bnp_tabular_labeled.npz.zip",
+    "path": PROJECT_ROOT / "bnp_tabular_labeled.npz.zip",
     "test_all_datasets": False,
 }
 
