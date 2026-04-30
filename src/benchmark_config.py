@@ -21,8 +21,8 @@ RESULTS_DIR = SRC_ROOT / "results"
 # --- Dataset --------------------------------------------------------------
 
 DATASET_CONFIG = {
-    "name": "annthyroid",
-    "path": ADBENCH_DATASETS / "2_annthyroid.npz",
+    "name": "bnp",
+    "path": ADBENCH_DATASETS / "bnp_tabular_labeled.npz.zip",
     "test_all_datasets": False,
 }
 
@@ -33,6 +33,7 @@ EVAL_DATASETS = {
     "cardio":     ADBENCH_DATASETS / "6_cardio.npz",
     "satellite":  ADBENCH_DATASETS / "30_satellite.npz",
     "fault":      ADBENCH_DATASETS / "12_fault.npz",
+    "bnp":        ADBENCH_DATASETS / "bnp_tabular_labeled.npz.zip"
 }
 
 # --- Model training -------------------------------------------------------

@@ -187,6 +187,10 @@ class Data(ABC):
             raise ValueError("_load() must set y_train_original")
         if self.unlabeled_policy not in UNLABELED_POLICIES:
             raise ValueError(f"Unknown policy '{self.unlabeled_policy}', use {UNLABELED_POLICIES}")
+        if labeled_ratio is None:
+            labeled_ratio = 0.1
+        if not 0 < labeled_ratio <= 1:
+            raise ValueError("labeled_ratio must be in (0, 1]")
 
         from sklearn.model_selection import train_test_split
 
@@ -203,12 +207,15 @@ class Data(ABC):
             vis_norm = rng.choice(normal_idx, size=min(n_norm, len(normal_idx)), replace=False)
             self.labeled_indexes = np.sort(np.concatenate([vis_norm, vis_anom]))
         else:
-            n_labeled = max(2, int(self.n_train * labeled_ratio))
-            self.labeled_indexes, _ = train_test_split(
-                np.arange(self.n_train), train_size=n_labeled,
-                stratify=self.y_train_original if stratified else None,
-                random_state=self.random_state)
-            self.labeled_indexes = np.sort(self.labeled_indexes)
+            n_labeled = min(self.n_train, max(2, int(self.n_train * labeled_ratio)))
+            if n_labeled == self.n_train:
+                self.labeled_indexes = np.arange(self.n_train)
+            else:
+                self.labeled_indexes, _ = train_test_split(
+                    np.arange(self.n_train), train_size=n_labeled,
+                    stratify=self.y_train_original if stratified else None,
+                    random_state=self.random_state)
+                self.labeled_indexes = np.sort(self.labeled_indexes)
 
         self.unlabeled_indexes = np.sort(np.setdiff1d(np.arange(self.n_train), self.labeled_indexes))
 
