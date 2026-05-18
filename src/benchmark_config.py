@@ -44,6 +44,8 @@ MODEL_CONFIGS = {
     "deepsad": {"total_epochs": 100, "pretrain": True, "ae_epochs": 20, "batch_size": 128},
     "devnet":  {"total_epochs": 3, "batch_size": 256, "nb_batch": 5, "network_depth": 2},
     "xgbod":   {"total_epochs": 3},
+    "bwgnn":   {"total_epochs": 100, "lr": 0.01, "h_feats": 32, "num_layers": 2, "mlp_layers": 2},
+    "xgbgraph": {"total_epochs": 1, "n_estimators": 100, "learning_rate": 0.05, "num_layers": 2, "agg": "mean"},
 }
 
 # --- Scenarios ------------------------------------------------------------

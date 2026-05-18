@@ -125,7 +125,7 @@ class Model(ABC):
 
     @abstractmethod
     def get_embeddings(self, indexes: Optional[np.ndarray] = None,
-                       use_train: bool = True) -> np.ndarray: ...
+                       use_train: bool = True, use_val: bool = False) -> np.ndarray: ...
 
     def get_loss(self, use_val: bool = False) -> Optional[float]:
         return None
@@ -250,8 +250,44 @@ class Data(ABC):
         return out
 
 
-class Strategy(ABC):
 
+class GraphData(Data):
+    def __init__(self, *args, data_type: str = "graph", add_self_loop: bool = True, **kwargs):
+        self.add_self_loop = add_self_loop
+        super().__init__(*args, data_type=data_type, **kwargs)
+
+    def _load(self) -> None:
+        self._load_graph()
+
+    @staticmethod
+    def _import_dgl():  # Hidden import to avoid dependency with tabular testing.
+        try:
+            import dgl  # noqa: F401
+        except ImportError as e:
+            raise ImportError("GraphData needs dgl imported.") from e
+
+    def _node_data(self, key: str):
+        val = self.graph.ndata[key]
+        if isinstance(val, dict):
+            if len(val) != 1:
+                raise ValueError(f"GraphData supports one node type, got '{key}' for {list(val)}")
+            return next(iter(val.values()))
+        return val
+
+    def _node_mask(self, key: str) -> np.ndarray:
+        return self._to_numpy(self._node_data(key)).astype(bool, copy=False).reshape(-1)
+
+    @staticmethod
+    def _to_numpy(value) -> np.ndarray:
+        if hasattr(value, "detach"):
+            return value.detach().cpu().numpy()
+        return np.asarray(value)
+
+    @abstractmethod
+    def _load_graph(self) -> None: ...
+
+
+class Strategy(ABC):
     @abstractmethod
     def should_continue(self, model_metrics: Dict[str, float], chapter: int) -> bool: ...
 
