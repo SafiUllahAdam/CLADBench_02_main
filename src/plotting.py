@@ -390,3 +390,4 @@ def save_figures(figures, filepath, project_root=None):
         fig.savefig(out, dpi=300, bbox_inches="tight")
         rel = out.relative_to(project_root) if project_root else out
         print(f"✓ {tag:16s} → {rel}")
+# plotting utility metadata update

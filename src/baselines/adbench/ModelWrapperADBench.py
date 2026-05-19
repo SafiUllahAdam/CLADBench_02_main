@@ -48,7 +48,7 @@ def get_model_detector_dict() -> Dict[str, type]:
 
 class PReNetWrapper(Model):
     """PReNet pairwise-ranking anomaly detector"""
-
+    role = "sd"
     def __init__(self, train_config: dict, model_config: dict, data: dict):
         defaults = {
             "seed": 42, "total_epochs": 100, "batch_num": 10,
@@ -180,11 +180,18 @@ class PReNetWrapper(Model):
             scores = np.full_like(scores, 0.5)
         return scores
 
-    def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True) -> np.ndarray:
+ #  def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True) -> np.ndarray:
+    def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True, use_val: bool = False) -> np.ndarray:
         if not self._fitted:
             self.fit()
 
-        X_src = self.X_train if use_train else (self.X_test or self.X_val)
+ #      X_src = self.X_train if use_train else (self.X_test if self.X_test is not None else self.X_val)
+        if use_train:
+            X_src = self.X_train
+        elif use_val:
+            X_src = self.X_val
+        else:
+            X_src = self.X_test
         if X_src is None:
             raise ValueError(f"No data for embeddings (use_train={use_train})")
         X_batch = X_src if indexes is None else X_src[indexes]
@@ -208,7 +215,7 @@ class PReNetWrapper(Model):
 
 class XGBODWrapper(Model):
     """XGBOD ensemble (XGBoost + unsupervised outlier detectors)"""
-
+    role = "ud"
     def __init__(self, train_config: dict, model_config: dict, data: dict):
         if not PYOD_AVAILABLE:
             raise ImportError(
@@ -255,20 +262,28 @@ class XGBODWrapper(Model):
             scores = np.full_like(scores, 0.5)
         return scores
 
-    def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True) -> np.ndarray:
+ #  def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True) -> np.ndarray:
+    def get_embeddings(self, indexes: Optional[np.ndarray] = None,
+                    use_train: bool = True, use_val: bool = False) -> np.ndarray:
         if not self._fitted:
             self.fit()
-        X_src = self.X_train if use_train else (self.X_test or self.X_val)
-        if X_src is None:
-            raise ValueError(f"No data for embeddings (use_train={use_train})")
-        X_batch = X_src if indexes is None else X_src[indexes]
-        # No internal embeddings, use decision scores
-        return self.detector.model.decision_function(X_batch).astype(float).reshape(-1, 1)
 
+        if use_train:
+            X_src = self.X_train
+        elif use_val:
+            X_src = self.X_val
+        else:
+            X_src = self.X_test
+
+        if X_src is None:
+            raise ValueError(f"No data for embeddings (use_train={use_train}, use_val={use_val})")
+
+        X_batch = X_src if indexes is None else X_src[indexes]
+        return self.detector.model.decision_function(X_batch).astype(float).reshape(-1, 1)
 
 class DeepSADWrapper(Model):
     """DeepSAD hypersphere-based anomaly detector"""
-
+    role = "ud"
     def __init__(self, train_config: dict, model_config: dict, data: dict):
         defaults = {
             "seed": 42, "total_epochs": 50, "pretrain": True,
@@ -388,10 +403,19 @@ class DeepSADWrapper(Model):
             scores = np.full_like(scores, 0.5)
         return scores
 
-    def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True) -> np.ndarray:
+#   def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True) -> np.ndarray:
+    def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True, use_val: bool = False) -> np.ndarray:
         if not self._fitted:
             self.fit()
-        X_src = self.X_train if use_train else (self.X_test or self.X_val)
+#        X_src = self.X_train if use_train else (self.X_test if self.X_test is not None else self.X_val)
+        
+        if use_train:
+            X_src = self.X_train
+        elif use_val:
+            X_src = self.X_val
+        else:
+            X_src = self.X_test
+    
         if X_src is None:
             raise ValueError(f"No data for embeddings (use_train={use_train})")
         X_batch = X_src if indexes is None else X_src[indexes]
@@ -430,23 +454,167 @@ class DeepSADWrapper(Model):
         return self._last_train_loss
 
 
+# class DevNetWrapper(Model):
+#     """DevNet deviation-network anomaly detector (requires TensorFlow)"""
+
+#     def __init__(self, train_config: dict, model_config: dict, data: dict):
+#         defaults = {
+#             "seed": 42, "total_epochs": 50, "batch_size": 512,
+#             "nb_batch": 20, "network_depth": 2,
+#         }
+#         config = {**defaults, **(train_config or {})}
+#         super().__init__(train_config=config, model_config=model_config, data=data)
+
+#         self.devnet = DevNet(seed=self.train_config["seed"], save_suffix=self.model_config.get("save_suffix", "wrapper"))
+#         self.devnet.args.batch_size = self.train_config["batch_size"]
+#         self.devnet.args.nb_batch = self.train_config["nb_batch"]
+#         self.devnet.args.epochs = 1
+#         self.devnet.network_depth = int(self.train_config["network_depth"])
+#         # Reference distribution for deviation scoring
+#         self.devnet.ref = tf.Variable(
+#             np.random.normal(loc=0.0, scale=1.0, size=5000).astype(np.float32),
+#             trainable=False,
+#         )
+#         self._loss_fn = self._build_devnet_loss(self.devnet.ref)
+
+#         self.model = None
+#         self.input_shape = None
+#         self.outlier_indices = None
+#         self.inlier_indices = None
+#         self.rng = np.random.RandomState(self.train_config["seed"])
+
+#         self._train_loss_history = []
+#         self._val_loss_history = []
+#         self._last_train_loss = None
+#         self._last_val_loss = None
+
+#     @staticmethod
+#     def _build_devnet_loss(ref_var: tf.Variable):
+#         def loss(y_true, y_pred):
+#             mean = tf.reduce_mean(ref_var)
+#             std = tf.math.reduce_std(ref_var)
+#             dev = (y_pred - mean) / (std + 1e-8)
+#             confidence_margin = 5.0
+#             inlier_loss = tf.abs(dev)
+#             outlier_loss = tf.abs(tf.nn.relu(confidence_margin - dev))
+#             return tf.reduce_mean((1.0 - y_true) * inlier_loss + y_true * outlier_loss)
+#         return loss
+
+#     def _ensure_model(self, X_train: np.ndarray, y_train: np.ndarray) -> None:
+#         if self.model is not None:
+#             return
+#         self.input_shape = X_train.shape[1:]
+#         self.outlier_indices = np.where(y_train == 1)[0]
+#         self.inlier_indices = np.where(y_train == 0)[0]
+#         self.model = self.devnet.deviation_network(self.input_shape, self.devnet.network_depth)
+#         opt = tf.keras.optimizers.RMSprop(clipnorm=1.0)
+#         self.model.compile(loss=self._loss_fn, optimizer=opt)
+#         self._model_path = self.devnet.modelpath + "/devnet_wrapper.h5"
+
+#     def fit(self) -> None:
+#         remaining = self.train_config["total_epochs"] - self._current_epoch
+#         if remaining > 0:
+#             self.train(remaining)
+#         self._fitted = True
+
+#     def train(self, epochs: int = 1) -> None:
+#         y_train = self.y_train
+#         self.outlier_indices = np.where(y_train == 1)[0]
+#         self.inlier_indices = np.where(y_train == 0)[0]
+#         self._ensure_model(self.X_train, y_train)
+
+#         batch_size = self.train_config["batch_size"]
+#         nb_batch = self.train_config["nb_batch"]
+
+#         for _ in range(epochs):
+#             generator = self.devnet.batch_generator_sup(
+#                 self.X_train, self.outlier_indices, self.inlier_indices,
+#                 batch_size, nb_batch, self.rng,
+#             )
+#             self.model.fit(generator, steps_per_epoch=nb_batch, epochs=1, verbose=0)
+#             self._current_epoch += 1
+#             self._fitted = True
+
+#             train_loss = self._compute_devnet_loss(self.X_train, self.y_train)
+#             if train_loss is not None:
+#                 self._last_train_loss = train_loss
+#                 self._train_loss_history.append(train_loss)
+
+#             if self.X_val is not None and self.y_val is not None and len(self.X_val) > 0:
+#                 val_loss = self._compute_devnet_loss(self.X_val, self.y_val)
+#                 if val_loss is not None:
+#                     self._last_val_loss = val_loss
+#                     self._val_loss_history.append(val_loss)
+
+#     def predict_scores(self, indexes: Optional[np.ndarray] = None, use_train: bool = False, use_val: bool = False) -> np.ndarray:
+#         if not self._fitted:
+#             self.fit()
+#         if use_train:
+#             X_data = self.X_train
+#         elif use_val:
+#             X_data = self.X_val
+#         else:
+#             X_data = self.X_test
+#         X_batch = X_data if indexes is None else X_data[indexes]
+#         scores = np.asarray(self.model.predict(X_batch)).reshape(-1)
+#         s_min, s_max = scores.min(), scores.max()
+#         if s_max - s_min > 1e-8:
+#             scores = (scores - s_min) / (s_max - s_min)
+#         else:
+#             scores = np.full_like(scores, 0.5)
+#         return scores
+
+#     def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True) -> np.ndarray:
+#         # No internal embeddings, use scores
+#         return self.predict_scores(indexes, use_train=use_train).reshape(-1, 1)
+
+#     def _compute_devnet_loss(self, X: np.ndarray, y: np.ndarray) -> Optional[float]:
+#         if self.model is None:
+#             return None
+#         scores = np.asarray(self.model.predict(X, verbose=0)).reshape(-1)
+#         ref_mean = np.mean(self.devnet.ref.numpy())
+#         ref_std = np.std(self.devnet.ref.numpy())
+#         dev = (scores - ref_mean) / (ref_std + 1e-8)
+#         confidence_margin = 5.0
+#         inlier_loss = np.abs(dev)
+#         outlier_loss = np.abs(np.maximum(0, confidence_margin - dev))
+#         losses = (1.0 - y) * inlier_loss + y * outlier_loss
+#         return float(np.mean(losses))
+
+#     def get_loss(self, use_val: bool = False) -> Optional[float]:
+#         if not self._fitted or self.model is None:
+#             return None
+#         if use_val:
+#             if self._last_val_loss is not None:
+#                 return self._last_val_loss
+#             if self.X_val is not None and self.y_val is not None and len(self.X_val) > 0:
+#                 return self._compute_devnet_loss(self.X_val, self.y_val)
+#             return None
+#         return self._last_train_loss
+
 class DevNetWrapper(Model):
     """DevNet deviation-network anomaly detector (requires TensorFlow)"""
-
+    role = "dd"
     def __init__(self, train_config: dict, model_config: dict, data: dict):
         defaults = {
             "seed": 42, "total_epochs": 50, "batch_size": 512,
-            "nb_batch": 20, "network_depth": 2,
+            "nb_batch": 20, "network_depth": None,
         }
         config = {**defaults, **(train_config or {})}
         super().__init__(train_config=config, model_config=model_config, data=data)
+
+        self.utils = Utils()
+        self.utils.set_seed(self.train_config["seed"])
+
+        if self.train_config["network_depth"] is None:
+            d = int(np.prod(self.X_train.shape[1:]))
+            self.train_config["network_depth"] = 4 if d > 20 else 2
 
         self.devnet = DevNet(seed=self.train_config["seed"], save_suffix=self.model_config.get("save_suffix", "wrapper"))
         self.devnet.args.batch_size = self.train_config["batch_size"]
         self.devnet.args.nb_batch = self.train_config["nb_batch"]
         self.devnet.args.epochs = 1
         self.devnet.network_depth = int(self.train_config["network_depth"])
-        # Reference distribution for deviation scoring
         self.devnet.ref = tf.Variable(
             np.random.normal(loc=0.0, scale=1.0, size=5000).astype(np.float32),
             trainable=False,
@@ -454,9 +622,9 @@ class DevNetWrapper(Model):
         self._loss_fn = self._build_devnet_loss(self.devnet.ref)
 
         self.model = None
+        self._best_weights = None
+        self._best_score = -float("inf")
         self.input_shape = None
-        self.outlier_indices = None
-        self.inlier_indices = None
         self.rng = np.random.RandomState(self.train_config["seed"])
 
         self._train_loss_history = []
@@ -466,6 +634,7 @@ class DevNetWrapper(Model):
 
     @staticmethod
     def _build_devnet_loss(ref_var: tf.Variable):
+        """Deviation loss: pull inliers to N(0,1), push outliers above margin"""
         def loss(y_true, y_pred):
             mean = tf.reduce_mean(ref_var)
             std = tf.math.reduce_std(ref_var)
@@ -476,16 +645,12 @@ class DevNetWrapper(Model):
             return tf.reduce_mean((1.0 - y_true) * inlier_loss + y_true * outlier_loss)
         return loss
 
-    def _ensure_model(self, X_train: np.ndarray, y_train: np.ndarray) -> None:
+    def _ensure_model(self, X_train: np.ndarray) -> None:
         if self.model is not None:
             return
         self.input_shape = X_train.shape[1:]
-        self.outlier_indices = np.where(y_train == 1)[0]
-        self.inlier_indices = np.where(y_train == 0)[0]
         self.model = self.devnet.deviation_network(self.input_shape, self.devnet.network_depth)
-        opt = tf.keras.optimizers.RMSprop(clipnorm=1.0)
-        self.model.compile(loss=self._loss_fn, optimizer=opt)
-        self._model_path = self.devnet.modelpath + "/devnet_wrapper.h5"
+        self.model.compile(loss=self._loss_fn, optimizer=tf.keras.optimizers.RMSprop(clipnorm=1.0))
 
     def fit(self) -> None:
         remaining = self.train_config["total_epochs"] - self._current_epoch
@@ -495,23 +660,26 @@ class DevNetWrapper(Model):
 
     def train(self, epochs: int = 1) -> None:
         y_train = self.y_train
-        self.outlier_indices = np.where(y_train == 1)[0]
-        self.inlier_indices = np.where(y_train == 0)[0]
-        self._ensure_model(self.X_train, y_train)
+        outlier_indices = np.where(y_train == 1)[0]
+        inlier_indices = np.where(y_train == 0)[0]
+        if len(outlier_indices) == 0 or len(inlier_indices) == 0:
+            logger.warning("[DevNet] empty outlier or inlier pool; skipping epoch")
+            return
+        self._ensure_model(self.X_train)
 
         batch_size = self.train_config["batch_size"]
         nb_batch = self.train_config["nb_batch"]
 
         for _ in range(epochs):
             generator = self.devnet.batch_generator_sup(
-                self.X_train, self.outlier_indices, self.inlier_indices,
+                self.X_train, outlier_indices, inlier_indices,
                 batch_size, nb_batch, self.rng,
             )
             self.model.fit(generator, steps_per_epoch=nb_batch, epochs=1, verbose=0)
             self._current_epoch += 1
             self._fitted = True
 
-            train_loss = self._compute_devnet_loss(self.X_train, self.y_train)
+            train_loss = self._compute_devnet_loss(self.X_train, y_train)
             if train_loss is not None:
                 self._last_train_loss = train_loss
                 self._train_loss_history.append(train_loss)
@@ -521,6 +689,43 @@ class DevNetWrapper(Model):
                 if val_loss is not None:
                     self._last_val_loss = val_loss
                     self._val_loss_history.append(val_loss)
+
+            self._maybe_save_best()
+
+    def _maybe_save_best(self) -> None:
+        """Track best weights by val AUC when y_val available, else train AUC; loss has trivial minimum"""
+        from sklearn.metrics import roc_auc_score
+        if self.X_val is not None and self.y_val is not None and len(self.X_val) > 0:
+            X_eval, y_eval = self.X_val, self.y_val
+        else:
+            X_eval, y_eval = self.X_train, self.y_train_original
+        if y_eval is None or np.unique(y_eval[np.isin(y_eval, [0, 1])]).size < 2:
+            return
+        scores = np.asarray(self.model.predict(X_eval, verbose=0)).reshape(-1)
+        if not np.all(np.isfinite(scores)):
+            return
+        try:
+            auc = roc_auc_score(y_eval, scores)
+        except Exception:
+            return
+        if auc > self._best_score:
+            self._best_score = auc
+            self._best_weights = self.model.get_weights()
+
+    def _with_best_weights(self):
+        """Context: temporarily swap in best-monitored weights for prediction"""
+        class _Swap:
+            def __init__(self, outer):
+                self.outer = outer
+                self.prev = None
+            def __enter__(self):
+                if self.outer._best_weights is not None:
+                    self.prev = self.outer.model.get_weights()
+                    self.outer.model.set_weights(self.outer._best_weights)
+            def __exit__(self, *a):
+                if self.prev is not None:
+                    self.outer.model.set_weights(self.prev)
+        return _Swap(self)
 
     def predict_scores(self, indexes: Optional[np.ndarray] = None, use_train: bool = False, use_val: bool = False) -> np.ndarray:
         if not self._fitted:
@@ -532,7 +737,9 @@ class DevNetWrapper(Model):
         else:
             X_data = self.X_test
         X_batch = X_data if indexes is None else X_data[indexes]
-        scores = np.asarray(self.model.predict(X_batch)).reshape(-1)
+
+        with self._with_best_weights():
+            scores = np.asarray(self.model.predict(X_batch, verbose=0)).reshape(-1)
         s_min, s_max = scores.min(), scores.max()
         if s_max - s_min > 1e-8:
             scores = (scores - s_min) / (s_max - s_min)
@@ -540,9 +747,27 @@ class DevNetWrapper(Model):
             scores = np.full_like(scores, 0.5)
         return scores
 
-    def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True) -> np.ndarray:
-        # No internal embeddings, use scores
-        return self.predict_scores(indexes, use_train=use_train).reshape(-1, 1)
+#   def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True) -> np.ndarray:
+    def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True, use_val: bool = False) -> np.ndarray:
+        """Penultimate dense layer activations (or score if shallow)"""
+        if not self._fitted:
+            self.fit()
+        if use_train:
+            X_src = self.X_train
+        elif use_val:
+            X_src = self.X_val
+        else:
+            X_src = self.X_test
+        if X_src is None:
+            raise ValueError(f"No data for embeddings (use_train={use_train})")
+        X_batch = X_src if indexes is None else X_src[indexes]
+
+        # Pick last hidden layer if exists, else fall back to score head
+        hidden_names = [l.name for l in self.model.layers if l.name.startswith("hl")]
+        out_layer = self.model.get_layer(hidden_names[-1]) if hidden_names else self.model.get_layer("score")
+        extractor = tf.keras.Model(inputs=self.model.input, outputs=out_layer.output)
+        with self._with_best_weights():
+            return np.asarray(extractor.predict(X_batch, verbose=0))
 
     def _compute_devnet_loss(self, X: np.ndarray, y: np.ndarray) -> Optional[float]:
         if self.model is None:

@@ -14,7 +14,6 @@ def _find_project_root() -> Path:
 
 PROJECT_ROOT = _find_project_root()
 SRC_ROOT = PROJECT_ROOT / "src"
-CUSTOM_DATA_ROOT = PROJECT_ROOT / "data"
 ADBENCH_ROOT = PROJECT_ROOT / "SubModules" / "ADBench"
 ADBENCH_DATASETS = ADBENCH_ROOT / "adbench" / "datasets" / "Classical"
 RESULTS_DIR = SRC_ROOT / "results"
@@ -22,8 +21,8 @@ RESULTS_DIR = SRC_ROOT / "results"
 # --- Dataset --------------------------------------------------------------
 
 DATASET_CONFIG = {
-    "name": "bnp",
-    "path": PROJECT_ROOT / "bnp_tabular_labeled.npz.zip",
+    "name": "annthyroid",
+    "path": ADBENCH_DATASETS / "2_annthyroid.npz",
     "test_all_datasets": False,
 }
 
@@ -34,7 +33,6 @@ EVAL_DATASETS = {
     "cardio":     ADBENCH_DATASETS / "6_cardio.npz",
     "satellite":  ADBENCH_DATASETS / "30_satellite.npz",
     "fault":      ADBENCH_DATASETS / "12_fault.npz",
-    "bnp":        ADBENCH_DATASETS / "bnp_tabular_labeled.npz.zip"
 }
 
 # --- Model training -------------------------------------------------------
@@ -42,7 +40,8 @@ EVAL_DATASETS = {
 MODEL_CONFIGS = {
     "prenet":  {"total_epochs": 100, "batch_size": 256},
     "deepsad": {"total_epochs": 100, "pretrain": True, "ae_epochs": 20, "batch_size": 128},
-    "devnet":  {"total_epochs": 3, "batch_size": 256, "nb_batch": 5, "network_depth": 2},
+    "devnet":  {"total_epochs": 50, "batch_size": 512, "nb_batch": 20},
+    # "devnet":  {"total_epochs": 3, "batch_size": 256, "nb_batch": 5, "network_depth": 2}, 
     "xgbod":   {"total_epochs": 3},
     "bwgnn":   {"total_epochs": 100, "lr": 0.01, "h_feats": 32, "num_layers": 2, "mlp_layers": 2},
     "xgbgraph": {"total_epochs": 1, "n_estimators": 100, "learning_rate": 0.05, "num_layers": 2, "agg": "mean"},
@@ -88,7 +87,7 @@ TEST_SCENARIOS = {
 
 # --- Cross-validation defaults --------------------------------------------
 
-CV_DEFAULTS = {
+CV_DEFAULTS = {                             # Run full benchmark 3 times, each time do these random but equal changes
     "seed": 58,
     "n_trials": 3,
     "warmup_epochs": 20,
@@ -140,3 +139,12 @@ def get_model_config(name: str) -> Dict[str, Any]:
 
 def get_all_scenarios() -> Dict[str, str]:
     return {k: v["description"] for k, v in TEST_SCENARIOS.items()}
+
+
+""" TRIAL loop (Cross Validation)
+    ↓
+CHAPTER loop (collaborative rounds)
+    ↓
+MODEL TRAINING loop
+    ↓
+EPOCH loop (inside each model) """
