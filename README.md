@@ -1,8 +1,8 @@
-# CoBench: Collaborative Anomaly Detection Benchmark
+# CLADBench: <ins>C</ins>ollaborative <ins>L</ins>earning for graph <ins>A</ins>nomaly <ins>D</ins>etection <ins>BENCH</ins>mark
 
 A research-grade benchmark for **collaborative semi-supervised anomaly detection**. Multiple heterogeneous models (PReNet, DeepSAD, DevNet, XGBOD) train together by exchanging pseudo-labels on unlabeled data, improving detection beyond solo baselines.
 
-Built on top of [ADBench](https://github.com/Minqi824/ADBench) (tabular anomaly detection). Graph support via [GADBench](https://github.com/FuanKahunaGod/GADBench) and [PyGOD](https://github.com/pygod-team/pygod) is planned.
+Built on top of [ADBench](https://github.com/Minqi824/ADBench) (tabular anomaly detection). Graph support via [GADBench](https://github.com/FuanKahunaGod/GADBench) and [PyGOD](https://github.com/pygod-team/pygod).
 
 ## Repository Structure
 
@@ -18,7 +18,7 @@ CoBench/
 │   ├── results_io.py           # CSV export (stats + raw per-trial)
 │   ├── benchmark_config.py     # Paths, hyperparameters, dataset registry
 │   ├── utils.py                # Seed, model factory, embedding extraction, data validation
-│   ├── alpha.ipynb             # Development / testing notebook
+│   ├── texgad.ipynb             # Development / testing notebook
 │   └── baselines/
 │       ├── adbench/
 │       │   ├── ModelWrapperADBench.py   # PReNet, DeepSAD, DevNet, XGBOD wrappers

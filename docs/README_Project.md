@@ -23,3 +23,4 @@ CoBench is a collaborative anomaly detection benchmark that unifies heterogeneou
 - Install deps from SubModules/ADBench/requirements.txt (plus PyOD for XGBOD).
 - Use src/mvp.ipynb to run warmup + collaborative tests on provided datasets.
 - For scripts, import from src/base.py and the ADBench wrappers, construct CoLearner, and call cotrain().
+

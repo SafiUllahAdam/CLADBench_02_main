@@ -125,7 +125,8 @@ class Model(ABC):
 
     @abstractmethod
     def get_embeddings(self, indexes: Optional[np.ndarray] = None,
-                       use_train: bool = True, use_val: bool = False) -> np.ndarray: ...
+      #                 use_train: bool = True) -> np.ndarray: ...
+                        use_train: bool = True, use_val: bool = False) -> np.ndarray: ...
 
     def get_loss(self, use_val: bool = False) -> Optional[float]:
         return None
@@ -187,10 +188,6 @@ class Data(ABC):
             raise ValueError("_load() must set y_train_original")
         if self.unlabeled_policy not in UNLABELED_POLICIES:
             raise ValueError(f"Unknown policy '{self.unlabeled_policy}', use {UNLABELED_POLICIES}")
-        if labeled_ratio is None:
-            labeled_ratio = 0.1
-        if not 0 < labeled_ratio <= 1:
-            raise ValueError("labeled_ratio must be in (0, 1]")
 
         from sklearn.model_selection import train_test_split
 
@@ -207,15 +204,12 @@ class Data(ABC):
             vis_norm = rng.choice(normal_idx, size=min(n_norm, len(normal_idx)), replace=False)
             self.labeled_indexes = np.sort(np.concatenate([vis_norm, vis_anom]))
         else:
-            n_labeled = min(self.n_train, max(2, int(self.n_train * labeled_ratio)))
-            if n_labeled == self.n_train:
-                self.labeled_indexes = np.arange(self.n_train)
-            else:
-                self.labeled_indexes, _ = train_test_split(
-                    np.arange(self.n_train), train_size=n_labeled,
-                    stratify=self.y_train_original if stratified else None,
-                    random_state=self.random_state)
-                self.labeled_indexes = np.sort(self.labeled_indexes)
+            n_labeled = max(2, int(self.n_train * labeled_ratio))
+            self.labeled_indexes, _ = train_test_split(
+                np.arange(self.n_train), train_size=n_labeled,
+                stratify=self.y_train_original if stratified else None,
+                random_state=self.random_state)
+            self.labeled_indexes = np.sort(self.labeled_indexes)
 
         self.unlabeled_indexes = np.sort(np.setdiff1d(np.arange(self.n_train), self.labeled_indexes))
 
@@ -249,12 +243,10 @@ class Data(ABC):
             raise ValueError(f"Unknown policy: {policy}")
         return out
 
-
-
 class GraphData(Data):
-    def __init__(self, *args, data_type: str = "graph", add_self_loop: bool = True, **kwargs):
+    def init(self, args, data_type: str = "graph", add_self_loop: bool = True, **kwargs):
         self.add_self_loop = add_self_loop
-        super().__init__(*args, data_type=data_type, **kwargs)
+        super().init(args, data_type=data_type, **kwargs)
 
     def _load(self) -> None:
         self._load_graph()
@@ -285,9 +277,9 @@ class GraphData(Data):
 
     @abstractmethod
     def _load_graph(self) -> None: ...
-
-
+    
 class Strategy(ABC):
+
     @abstractmethod
     def should_continue(self, model_metrics: Dict[str, float], chapter: int) -> bool: ...
 
@@ -338,11 +330,10 @@ class CoLearning(ABC):
 
         s = scores[indexes]
         mask = (s > threshold) if kind == "high" else (s < threshold)
-        confidences = np.abs(s[mask] - threshold)
         idxs = indexes[mask]
         if len(idxs) == 0:
             return 0
-
+        confidences = np.abs(s[mask] - threshold)
         receiver = self.models[receiver_idx]
         if receiver._pseudo_label_meta is None:
             receiver._pseudo_label_meta = {}
@@ -371,7 +362,7 @@ class CoLearning(ABC):
 
     def send_normals(self, sender_idx, receiver_idx, indexes, scores) -> int:
         return self._propose_labels(sender_idx, receiver_idx, indexes, scores, label=0, kind="low")
-
+ 
     @abstractmethod
     def exchange(self) -> None: ...
 

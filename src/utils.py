@@ -43,14 +43,26 @@ def _iter_batches(array: np.ndarray, batch_size: int) -> Iterable[np.ndarray]:
         yield array[i:i + batch_size]
 
 
-def _resolve_input(model: Model, indexes: Optional[np.ndarray], use_train: bool) -> np.ndarray:
-    X = model.X_train if use_train else model.X_test
-    if X is None:
-        X = model.X_val
-    if X is None:
-        raise ValueError("No input data on model (X_train/X_test/X_val all None)")
-    return X if indexes is None else X[indexes]
+# def _resolve_input(model: Model, indexes: Optional[np.ndarray], use_train: bool) -> np.ndarray:
+#     X = model.X_train if use_train else model.X_test
+#     if X is None:
+#         X = model.X_val
+#     if X is None:
+#         raise ValueError("No input data on model (X_train/X_test/X_val all None)")
+#     return X if indexes is None else X[indexes]
 
+def _resolve_input(model: Model, indexes: Optional[np.ndarray],
+                   use_train: bool, use_val: bool = False) -> np.ndarray:
+    if use_train:
+        X = model.X_train
+    elif use_val:
+        X = model.X_val
+    else:
+        X = model.X_test
+
+    if X is None:
+        raise ValueError("No requested input data on model")
+    return X if indexes is None else X[indexes]
 
 def extract_embeddings_auto(model: Model, indexes: Optional[np.ndarray] = None,
                             use_train: bool = False, use_val: bool = False,
@@ -60,14 +72,16 @@ def extract_embeddings_auto(model: Model, indexes: Optional[np.ndarray] = None,
     name = model.__class__.__name__
 
     try:
-        emb = model.get_embeddings(indexes, use_train=use_train)
+#       emb = model.get_embeddings(indexes, use_train=use_train)
+        emb = model.get_embeddings(indexes, use_train=use_train, use_val=use_val)
         if emb is not None:
             logger.info(f"[{name}] Embeddings via get_embeddings()")
             return emb
     except Exception as e:
         logger.warning(f"[{name}] get_embeddings() failed: {e}")
 
-    X = _resolve_input(model, indexes, use_train=use_train or not use_val)
+#   X = _resolve_input(model, indexes, use_train=use_train or not use_val)
+    X = _resolve_input(model, indexes, use_train=use_train, use_val=use_val)
 
     try:
         import torch

@@ -14,7 +14,7 @@ COLUMN_FIXES = {
     "col_1": None,
     "former": "Transformer",
 }
-
+ 
 # D4/D5 have SVDD and GMM as sub-headers; D6-D16 have Transformer
 D4_D5_RENAMES = {"col": "SVDD", "col_1": "GMM"}
 D6_PLUS_RENAMES = {"col": "Transformer"}
@@ -223,3 +223,4 @@ if __name__ == "__main__":
     else:
         print("Fixing existing CSVs...")
         fix_existing_csvs()
+# extraction utility metadata update

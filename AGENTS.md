@@ -42,3 +42,4 @@ Don't change API unless asked. Don't add functions unless necessary. Short clear
 ## Agent notes
 - GRU embeddings: pad to same dim, stack axis=1 → shape `(n_samples, n_detectors, dim)`.
 - `RecurrentPlateauStrategy.recurrent_start_chapter` must match `DelayedRecurrentCoLearner.recurrent_start_chapter`.
+

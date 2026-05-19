@@ -11,7 +11,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from benchmark_config import CV_DEFAULTS, PROJECT_ROOT
 from baselines.adbench.ModelWrapperADBench import get_model_detector_dict
 from baselines.adbench.data_loader import ClassicalADBenchData
-from colearner import CoLearnerVal, DelayedRecurrentCoLearner
+from colearner import BasicAdaptiveCoLearner, DelayedRecurrentBasicAdaptiveCoLearner
 from recurrentmodels import GRURecurrentModel
 from strategy import PlateauStrategy, AdaptivePlateauStrategy, RecurrentPlateauStrategy
 from utils import create_models, set_seed
@@ -43,13 +43,49 @@ def _append_metrics(store: dict, metrics: dict) -> None:
     for k in ("auc", "ap", "train_loss", "val_loss"):
         store[k].append(metrics[k])
 
+#CHANGE1
+
+def _detect_convergence_chapter(values, window: int = 3, delta: float = 0.001):
+    vals = np.asarray(values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size < window + 1:
+        return None
+
+    diffs = np.abs(np.diff(vals))
+    for i in range(window - 1, len(diffs)):
+        if np.all(diffs[i - window + 1:i + 1] <= delta):
+            return i + 1
+    return None
+
+#CHANGE1
 
 def run_cv(args, dataset_name: str, dataset_path: Path) -> dict:
     registry = get_model_detector_dict()
     model_names = args.models
     has_gru = args.recurrent_judge == "gru"
 
+    #CHANGE2
     cv_results = {
+        "n_trials": args.n_trials,
+        "dataset": str(dataset_path),
+        "model_names": list(model_names),
+        "seeds": [],
+        "gru_start_chapter": args.gru_start_chapter,
+        "solo": {n: {"auc": [], "ap": [], "train_loss": [], "val_loss": []} for n in model_names},
+        "collab": {n: {"auc": [], "ap": [], "train_loss": [], "val_loss": []}
+                   for n in list(model_names) + ["ensemble"]},
+        "collab_chapters": [],
+        "collab_val_loss": [],
+        "convergence": {
+            "collab": {n: [] for n in model_names},
+            "gru": {n: [] for n in model_names},
+        },
+        "gru": {"auc": [], "ap": [], "train_loss": [], "val_loss": [], "chapters": []},
+    }
+    #CHANGE2
+
+
+    """     cv_results = {
         "n_trials": args.n_trials, "dataset": str(dataset_path),
         "model_names": list(model_names), "seeds": [],
         "solo": {n: {"auc": [], "ap": [], "train_loss": [], "val_loss": []} for n in model_names},
@@ -57,7 +93,7 @@ def run_cv(args, dataset_name: str, dataset_path: Path) -> dict:
                    for n in list(model_names) + ["ensemble"]},
         "collab_chapters": [], "collab_val_loss": [],
         "gru": {"auc": [], "ap": [], "train_loss": [], "val_loss": [], "chapters": []},
-    }
+    }  """
 
     for trial_idx in range(args.n_trials):
         seed = args.seed + trial_idx
@@ -86,22 +122,39 @@ def run_cv(args, dataset_name: str, dataset_path: Path) -> dict:
         StrategyClass = STRATEGY_REGISTRY[args.colearning_strategy]
         collab_models = create_models(registry, model_names, trial_data)
         collab_strat = StrategyClass(patience=args.patience, mode="max", min_delta=0.001)
-        collab_cl = CoLearnerVal(
+
+        collab_cl = BasicAdaptiveCoLearner(
             models=collab_models, data=trial_data, strategy=collab_strat,
             warmup_epochs=args.warmup_epochs, max_chapters=args.max_chapters,
             epochs_per_chapter=args.epochs_per_chapter,
+            anomaly_threshold=0.5,
+            confidence_threshold_low=0.05,
+            confidence_threshold_high=0.95,
         )
+            
+        #CHANGE3
         collab_hist = collab_cl.cotrain(eval_interval=1)
         cv_results["collab_chapters"].append(collab_hist)
         cv_results["collab_val_loss"].append(
             {k: v.copy() for k, v in collab_cl.val_loss_history.items()})
+
+        for i, name in enumerate(model_names):
+            conv_ch = _detect_convergence_chapter(collab_cl.val_loss_history.get(i, []))
+            cv_results["convergence"]["collab"][name].append(conv_ch)
+        #CHANGE3            
+            
+            
+        """         collab_hist = collab_cl.cotrain(eval_interval=1)
+        cv_results["collab_chapters"].append(collab_hist)
+        cv_results["collab_val_loss"].append(
+            {k: v.copy() for k, v in collab_cl.val_loss_history.items()}) """
 
         for name, m in zip(model_names, collab_models):
             m_res = _score_model(m, trial_data.y_test)
             _append_metrics(cv_results["collab"][name], m_res)
             logger.info(f"  Collab {name:<10} AUC={m_res['auc']:.4f}  AP={m_res['ap']:.4f}")
 
-        ens_sc = np.mean([m.predict_scores() for m in collab_models], axis=0)
+        ens_sc = collab_cl._adaptive_ensemble_scores([m.predict_scores() for m in collab_models])
         ens_auc = roc_auc_score(trial_data.y_test, ens_sc)
         ens_ap = average_precision_score(trial_data.y_test, ens_sc)
         cv_results["collab"]["ensemble"]["auc"].append(ens_auc)
@@ -137,14 +190,25 @@ def _run_gru_trial(args, registry, model_names, trial_data, seed, cv_results) ->
             fallback_key="ensemble", recurrent_key="gru", mode="max",
             patience_fallback=args.patience, patience_recurrent=3, min_delta=0.001,
         )
-        gru_cl = DelayedRecurrentCoLearner(
+        gru_cl = DelayedRecurrentBasicAdaptiveCoLearner(
             models=gru_models, data=trial_data, strategy=gru_strat,
             recurrent_model=gru_m, warmup_epochs=args.warmup_epochs,
             max_chapters=args.max_chapters, embeddings_aggregate="stack",
             recurrent_start_chapter=args.gru_start_chapter,
+            epochs_per_chapter=args.epochs_per_chapter,
+            anomaly_threshold=0.5,
+            confidence_threshold_low=0.05,
+            confidence_threshold_high=0.95,
         )
         hist_gru = gru_cl.cotrain(eval_interval=1)
 
+
+#CHANGE4
+        for i, name in enumerate(model_names):
+            conv_ch = _detect_convergence_chapter(gru_cl.val_loss_history.get(i, []))
+            cv_results["convergence"]["gru"][name].append(conv_ch)
+#CHANGE4
+        
         gru_cl.embeddings_use_train = False
         test_emb = gru_cl._collect_embeddings(indexes=None)
         gru_sc = gru_m.predict_scores(test_emb)
@@ -162,12 +226,14 @@ def _run_gru_trial(args, registry, model_names, trial_data, seed, cv_results) ->
         for k in ("auc", "ap", "train_loss", "val_loss"):
             cv_results["gru"][k].append(g[k])
         cv_results["gru"]["chapters"].append(g["chapters"])
+#CHANGE5
+        for name in model_names:
+            cv_results["convergence"]["gru"][name].append(None)
+#CHANGE5
 
-
-def _fmt(arr):
-    return f"{np.nanmean(arr):.4f} ± {np.nanstd(arr):.4f}"
-
-
+ 
+def _fmt(arr):                                                   # A one-liner formatter: given a list of numbers (e.g. AUC across 5 trials), it returns a readable string like 0.8312 ± 0.0145. Used purely for printing the summary table nicely.
+    return f"{np.nanmean(arr):.4f} ± {np.nanstd(arr):.4f}"                                      
 def print_summary(cv_results: dict, dataset_name: str, has_gru: bool) -> None:
     names = cv_results["model_names"]
     nt = cv_results["n_trials"]
@@ -204,17 +270,42 @@ def print_summary(cv_results: dict, dataset_name: str, has_gru: bool) -> None:
             print(f"  {'-'*68}")
             print(f"  {'GRU judge':<26} {_fmt(d_auc)}     {_fmt(d_ap)}")
 
+#CHANGE6
+    print(f"\n  {'Convergence check':<26} {'Mean ± std chapter':<22}")
+    print(f"  {'-'*56}")
+    for n in names:
+        vals = [v for v in cv_results["convergence"]["collab"][n] if v is not None]
+        if vals:
+            print(f"  {'Collab ' + n:<26} {np.mean(vals):.2f} ± {np.std(vals):.2f}")
+        else:
+            print(f"  {'Collab ' + n:<26} not detected")
+
+    if has_gru:
+        for n in names:
+            vals = [v for v in cv_results["convergence"]["gru"][n] if v is not None]
+            if vals:
+                print(f"  {'GRU run ' + n:<26} {np.mean(vals):.2f} ± {np.std(vals):.2f}")
+            else:
+                print(f"  {'GRU run ' + n:<26} not detected")
+        print(f"  {'GRU start':<26} {cv_results['gru_start_chapter']}")
+        
+#CHANGE6
 
 def generate_plots(cv_results: dict, dataset_name: str,
                    has_gru: bool, filepath: Path) -> None:
     from plotting import (COLORS, plot_chapter_dynamics, plot_final_bars,
                           plot_loss_evolution, save_figures)
     import matplotlib
-    matplotlib.use("Agg")
+    # matplotlib.use("Agg")
 
     figures = {
         "fig_dynamics": plot_chapter_dynamics(cv_results, COLORS, dataset_name),
         "fig_barplot": plot_final_bars(cv_results, COLORS, dataset_name),
         "fig_losses": plot_loss_evolution(cv_results, COLORS, dataset_name, has_recurrent=has_gru),
     }
+    import matplotlib.pyplot as plt
+
+    for fig in figures.values():
+        plt.show()
+
     save_figures(figures, filepath, PROJECT_ROOT)

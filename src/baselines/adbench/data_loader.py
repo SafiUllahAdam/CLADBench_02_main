@@ -53,7 +53,7 @@ class ClassicalADBenchData(Data):
         )
     
     def assign_global_indexes(self) -> None:
-        data = self._raw_data
+        data = self._raw_data   # checks type of data
         files = set(data.files)
         
         # Determine total sample count
