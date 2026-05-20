@@ -4,6 +4,8 @@ from typing import Dict, Optional
 import logging
 import numpy as np
 import torch
+from sklearn.metrics import log_loss
+from catboost import CatBoostClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,7 @@ def get_model_detector_dict() -> Dict[str, type]:
     registry: Dict[str, type] = {
         "prenet": PReNetWrapper,
         "deepsad": DeepSADWrapper,
+        "catboost": CatBoostWrapper,
     }
     if TF_AVAILABLE:
         registry["devnet"] = DevNetWrapper
@@ -280,6 +283,60 @@ class XGBODWrapper(Model):
 
         X_batch = X_src if indexes is None else X_src[indexes]
         return self.detector.model.decision_function(X_batch).astype(float).reshape(-1, 1)
+
+
+class CatBoostWrapper(Model):
+    """CatBoost gradient-boosted tree anomaly detector"""
+    role = "sd"
+
+    def __init__(self, train_config: dict, model_config: dict, data: dict):
+        config = {**{"seed": 42, "iterations": 200, "depth": 6,
+                     "learning_rate": 0.05, "l2_leaf_reg": 3.0}, **(train_config or {})}
+        super().__init__(train_config=config, model_config=model_config, data=data)
+        self.model = CatBoostClassifier(
+            iterations=config["iterations"], depth=config["depth"],
+            learning_rate=config["learning_rate"], l2_leaf_reg=config["l2_leaf_reg"],
+            loss_function="Logloss", random_seed=config["seed"],
+            auto_class_weights="Balanced", allow_writing_files=False, verbose=False,
+        )
+        self._train_loss_history = []
+        self._val_loss_history = []
+
+    def _proba(self, X: np.ndarray) -> np.ndarray:
+        """Anomaly-class probability for a feature batch"""
+        return self.model.predict_proba(X)[:, 1].astype(float)
+
+    def train(self, epochs: int = 1) -> None:
+        """Refit every boosting round on the labeled + pseudo-labeled samples; one loss point per call"""
+        labeled = self.y_train != -1
+        X, y = self.X_train[labeled], self.y_train[labeled].astype(int)
+        self.model.fit(X, y)
+        self._fitted = True
+        self._train_loss_history.append(log_loss(y, self._proba(X), labels=[0, 1]))
+        if self.X_val is not None and self.y_val is not None and len(self.X_val) > 0:
+            self._val_loss_history.append(log_loss(self.y_val, self._proba(self.X_val), labels=[0, 1]))
+
+    def fit(self) -> None:
+        self.train()
+
+    def predict_scores(self, indexes: Optional[np.ndarray] = None, use_train: bool = False, use_val: bool = False) -> np.ndarray:
+        if not self._fitted:
+            self.fit()
+        X_data = self.X_train if use_train else (self.X_val if use_val else self.X_test)
+        X_batch = X_data if indexes is None else X_data[indexes]
+        return self._proba(X_batch)
+
+    def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True, use_val: bool = False) -> np.ndarray:
+        if not self._fitted:
+            self.fit()
+        X_src = self.X_train if use_train else (self.X_val if use_val else self.X_test)
+        X_batch = X_src if indexes is None else X_src[indexes]
+        return self._proba(X_batch).reshape(-1, 1)
+
+    def get_loss(self, use_val: bool = False) -> Optional[float]:
+        history = self._val_loss_history if use_val else self._train_loss_history
+        return history[-1] if history else None
+
 
 class DeepSADWrapper(Model):
     """DeepSAD hypersphere-based anomaly detector"""
