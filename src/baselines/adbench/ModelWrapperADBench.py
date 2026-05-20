@@ -4,6 +4,8 @@ from typing import Dict, Optional
 import logging
 import numpy as np
 import torch
+import torch.nn.functional as F
+import rtdl
 from sklearn.metrics import log_loss
 from catboost import CatBoostClassifier
 
@@ -41,6 +43,7 @@ def get_model_detector_dict() -> Dict[str, type]:
         "prenet": PReNetWrapper,
         "deepsad": DeepSADWrapper,
         "catboost": CatBoostWrapper,
+        "fttransformer": FTTransformerWrapper,
     }
     if TF_AVAILABLE:
         registry["devnet"] = DevNetWrapper
@@ -332,6 +335,82 @@ class CatBoostWrapper(Model):
         X_src = self.X_train if use_train else (self.X_val if use_val else self.X_test)
         X_batch = X_src if indexes is None else X_src[indexes]
         return self._proba(X_batch).reshape(-1, 1)
+
+    def get_loss(self, use_val: bool = False) -> Optional[float]:
+        history = self._val_loss_history if use_val else self._train_loss_history
+        return history[-1] if history else None
+
+
+class FTTransformerWrapper(Model):
+    """FT-Transformer attention-based tabular anomaly detector"""
+    role = "dd"
+
+    def __init__(self, train_config: dict, model_config: dict, data: dict):
+        config = {**{"seed": 42, "total_epochs": 30, "batch_size": 256}, **(train_config or {})}
+        super().__init__(train_config=config, model_config=model_config, data=data)
+        torch.manual_seed(config["seed"])
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_size = config["batch_size"]
+        self.model = rtdl.FTTransformer.make_default(
+            n_num_features=self.X_train.shape[1], cat_cardinalities=None,
+            last_layer_query_idx=[-1], d_out=1,
+        ).to(self.device)
+        self.optimizer = self.model.make_default_optimizer()
+        self._train_loss_history = []
+        self._val_loss_history = []
+
+    def _proba(self, X: np.ndarray) -> np.ndarray:
+        """Anomaly probability for a feature batch (batched forward + sigmoid)"""
+        self.model.eval()
+        out = []
+        with torch.no_grad():
+            for i in range(0, len(X), self.batch_size):
+                xb = torch.as_tensor(X[i:i + self.batch_size], dtype=torch.float32, device=self.device)
+                out.append(torch.sigmoid(self.model(xb, None).squeeze(-1)))
+        return torch.cat(out).cpu().numpy().astype(float)
+
+    def train(self, epochs: int = 1) -> None:
+        """Run `epochs` gradient passes over the labeled + pseudo-labeled samples"""
+        labeled = self.y_train != -1
+        y_np = self.y_train[labeled].astype(int)
+        X = torch.as_tensor(self.X_train[labeled], dtype=torch.float32, device=self.device)
+        y = torch.as_tensor(y_np.astype(np.float32), device=self.device)
+        for _ in range(epochs):
+            self.model.train()
+            for idx in torch.randperm(len(X), device=self.device).split(self.batch_size):
+                self.optimizer.zero_grad()
+                loss = F.binary_cross_entropy_with_logits(self.model(X[idx], None).squeeze(-1), y[idx])
+                loss.backward()
+                self.optimizer.step()
+            self._fitted = True
+            self._train_loss_history.append(log_loss(y_np, self._proba(self.X_train[labeled]), labels=[0, 1]))
+            if self.X_val is not None and self.y_val is not None and len(self.X_val) > 0:
+                self._val_loss_history.append(log_loss(self.y_val, self._proba(self.X_val), labels=[0, 1]))
+
+    def fit(self) -> None:
+        self.train(self.train_config["total_epochs"])
+
+    def predict_scores(self, indexes: Optional[np.ndarray] = None, use_train: bool = False, use_val: bool = False) -> np.ndarray:
+        if not self._fitted:
+            self.fit()
+        X_data = self.X_train if use_train else (self.X_val if use_val else self.X_test)
+        X_batch = X_data if indexes is None else X_data[indexes]
+        return self._proba(X_batch)
+
+    def get_embeddings(self, indexes: Optional[np.ndarray] = None, use_train: bool = True, use_val: bool = False) -> np.ndarray:
+        if not self._fitted:
+            self.fit()
+        X_data = self.X_train if use_train else (self.X_val if use_val else self.X_test)
+        X_batch = X_data if indexes is None else X_data[indexes]
+        captured = []
+        # the head's input is the pooled CLS token — FT-Transformer's learned representation
+        handle = self.model.transformer.head.register_forward_hook(lambda m, inp, out: captured.append(inp[0]))
+        try:
+            self._proba(X_batch)
+        finally:
+            handle.remove()
+        emb = torch.cat(captured)
+        return emb.reshape(emb.shape[0], -1).cpu().numpy().astype(float)
 
     def get_loss(self, use_val: bool = False) -> Optional[float]:
         history = self._val_loss_history if use_val else self._train_loss_history
