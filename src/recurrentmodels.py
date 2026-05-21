@@ -68,7 +68,7 @@ class GRURecurrentModel(RecurrentModel):
         self._best_state = None
         self._invert = False
         
-    def _prepare_batch(self, embeddings: np.ndarray, labels: Optional[np.ndarray] = None):
+    def _prepare_embeddings_array(self, embeddings: np.ndarray, build_if_needed: bool = True) -> np.ndarray:
         x = np.asarray(embeddings, dtype=np.float32)
         if x.ndim != 3:
             raise ValueError(f"embeddings must be 3D [n_samples, n_detectors, feature_dim], got shape {x.shape}")
@@ -77,7 +77,13 @@ class GRURecurrentModel(RecurrentModel):
                 f"expected n_detectors={self.n_detectors}, got {x.shape[1]}"
 
         if self._gru is None or self._input_size != x.shape[-1]:
+            if not build_if_needed:
+                raise ValueError(f"expected feature_dim={self._input_size}, got {x.shape[-1]}")
             self._build(x.shape[-1])
+        return x
+
+    def _prepare_batch(self, embeddings: np.ndarray, labels: Optional[np.ndarray] = None):
+        x = self._prepare_embeddings_array(embeddings)
         xt = torch.as_tensor(x, dtype=torch.float32, device=self.device)
 
         if labels is None:
@@ -198,9 +204,13 @@ class GRURecurrentModel(RecurrentModel):
     def predict_scores(self, aggregated_embeddings: np.ndarray) -> np.ndarray:
         if not self._fitted:
             raise RuntimeError("GRURecurrentModel must be fit before predict_scores()")
-        x, _, _ = self._prepare_batch(aggregated_embeddings)
+        x = self._prepare_embeddings_array(aggregated_embeddings, build_if_needed=False)
         self._gru.eval()
         self._classifier.eval()
-        with torch.no_grad():
-            scores = torch.sigmoid(self._forward(x)).cpu().numpy().astype(np.float32).ravel()
+        scores = np.empty(x.shape[0], dtype=np.float32)
+        with torch.inference_mode():
+            for start in range(0, x.shape[0], self.batch_size):
+                end = min(start + self.batch_size, x.shape[0])
+                xb = torch.as_tensor(x[start:end], dtype=torch.float32, device=self.device)
+                scores[start:end] = torch.sigmoid(self._forward(xb)).cpu().numpy().astype(np.float32).ravel()
         return (1.0 - scores).astype(np.float32) if self._invert else scores
