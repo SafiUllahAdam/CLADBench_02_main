@@ -369,6 +369,7 @@ class GraphSAGEWrapper(BWGNNWrapper):
 
 class XGBGraphWrapper(_GraphWrapperBase):
     """XGBoost on graph-aggregated node features."""
+    epoch_friendly = False
 
     def __init__(self, train_config: dict, model_config: dict, data):
         if XGBOOST_ERROR is not None:
@@ -417,17 +418,21 @@ class XGBGraphWrapper(_GraphWrapperBase):
                 raise ValueError("agg must be one of: mean, sum, max")
             return self.graph.ndata["h"]
 
+    def fit(self) -> None:
+        if not self._fitted:
+            self.train(1)
+        self._fitted = True
+
     def train(self, epochs: int = 1) -> None:
-        for _ in range(epochs):
-            nodes, labels = self._known_train_rows()
-            idx = nodes.detach().cpu().numpy()
-            y = labels.detach().cpu().numpy()
-            weights = np.where(y == 0, 1.0, max(1.0, np.sum(y == 0) / max(np.sum(y == 1), 1)))
-            self.model = self._build_model()
-            self.model.fit(self.X_graph[idx], y, sample_weight=weights, verbose=False)
-            self._current_epoch += 1
-            self._fitted = True
-            self._record_losses()
+        nodes, labels = self._known_train_rows()
+        idx = nodes.detach().cpu().numpy()
+        y = labels.detach().cpu().numpy()
+        weights = np.where(y == 0, 1.0, max(1.0, np.sum(y == 0) / max(np.sum(y == 1), 1)))
+        self.model = self._build_model()
+        self.model.fit(self.X_graph[idx], y, sample_weight=weights, verbose=False)
+        self._current_epoch += 1
+        self._fitted = True
+        self._record_losses()
 
     def _record_losses(self) -> None:
         train_loss = self._compute_loss(self.train_node_idx.detach().cpu().numpy(), self.y_train)

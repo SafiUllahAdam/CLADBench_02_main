@@ -221,6 +221,7 @@ class PReNetWrapper(Model):
 
 class XGBODWrapper(Model):
     """XGBOD ensemble (XGBoost + unsupervised outlier detectors)"""
+    epoch_friendly = False
     role = "ud"
     def __init__(self, train_config: dict, model_config: dict, data: dict):
         if not PYOD_AVAILABLE:
@@ -228,7 +229,7 @@ class XGBODWrapper(Model):
                 "PyOD not available. Install scikit-learn==1.0.2 and pyod==1.0.9 with --no-cache-dir"
             ) from PYOD_IMPORT_ERROR
 
-        config = {**{"seed": 42, "total_epochs": 10}, **(train_config or {})}
+        config = {**{"seed": 42, "total_epochs": 1}, **(train_config or {})}
         super().__init__(train_config=config, model_config=model_config, data=data)
         self.detector: Optional[PYOD] = None
 
@@ -236,18 +237,16 @@ class XGBODWrapper(Model):
         self.detector = PYOD(seed=self.train_config["seed"], model_name="XGBOD", tune=False)
 
     def fit(self) -> None:
-        remaining = self.train_config["total_epochs"] - self._current_epoch
-        if remaining > 0:
-            self.train(remaining)
+        if not self._fitted:
+            self.train(1)
         self._fitted = True
 
     def train(self, epochs: int = 1) -> None:
         if self.detector is None:
             self._build_detector()
         y_train = self.y_train
-        for _ in range(epochs):
-            self.detector.fit(self.X_train, y_train)
-            self._current_epoch += 1
+        self.detector.fit(self.X_train, y_train)
+        self._current_epoch += 1
         self._fitted = True
 
     def predict_scores(self, indexes: Optional[np.ndarray] = None, use_train: bool = False, use_val: bool = False) -> np.ndarray:
@@ -290,11 +289,13 @@ class XGBODWrapper(Model):
 
 class CatBoostWrapper(Model):
     """CatBoost gradient-boosted tree anomaly detector"""
+    epoch_friendly = False
     role = "sd"
 
     def __init__(self, train_config: dict, model_config: dict, data: dict):
         config = {**{"seed": 42, "iterations": 200, "depth": 6,
-                     "learning_rate": 0.05, "l2_leaf_reg": 3.0}, **(train_config or {})}
+                     "learning_rate": 0.05, "l2_leaf_reg": 3.0,
+                     "total_epochs": 1}, **(train_config or {})}
         super().__init__(train_config=config, model_config=model_config, data=data)
         self.model = CatBoostClassifier(
             iterations=config["iterations"], depth=config["depth"],
@@ -315,6 +316,7 @@ class CatBoostWrapper(Model):
         X, y = self.X_train[labeled], self.y_train[labeled].astype(int)
         self.model.fit(X, y)
         self._fitted = True
+        self._current_epoch += 1
         self._train_loss_history.append(log_loss(y, self._proba(X), labels=[0, 1]))
         if self.X_val is not None and self.y_val is not None and len(self.X_val) > 0:
             self._val_loss_history.append(log_loss(self.y_val, self._proba(self.X_val), labels=[0, 1]))
@@ -523,15 +525,10 @@ class DeepSADWrapper(Model):
             X_data = self.X_test
         X_batch = X_data if indexes is None else X_data[indexes]
 
-        # Cache test dataset to avoid rebuilding on repeated calls
-        x_id = id(X_batch)
-        if not hasattr(self, '_test_ds_cache_id') or self._test_ds_cache_id != x_id:
-            self._test_ds_cache = load_dataset(
-                data={"X_test": X_batch, "y_test": np.zeros(len(X_batch))}, train=False,
-            )
-            self._test_ds_cache_id = x_id
-
-        scores = self.deepsad.test(self._test_ds_cache, device=self.device, n_jobs_dataloader=0)
+        test_ds = load_dataset(
+            data={"X_test": X_batch, "y_test": np.zeros(len(X_batch))}, train=False,
+        )
+        scores = self.deepsad.test(test_ds, device=self.device, n_jobs_dataloader=0)
         s_min, s_max = scores.min(), scores.max()
         if s_max - s_min > 1e-8:
             scores = (scores - s_min) / (s_max - s_min)
