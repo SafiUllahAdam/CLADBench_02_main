@@ -136,6 +136,7 @@ class GRURecurrentModel(RecurrentModel):
                     with torch.no_grad():
                         v_loss = self._criterion(self._forward(x_val[mask_val]), y_val[mask_val]).item()
                     self._val_loss_history.append(v_loss)
+                    
     def update_best(self, val_auc: float) -> bool:
         if self._gru is None or self._classifier is None:
             return False

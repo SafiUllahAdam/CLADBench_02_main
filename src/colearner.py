@@ -655,7 +655,7 @@ class BasicAdaptiveCoLearner(CoLearnerVal):
 
 
 class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
-    """TExGAD triple exchange + adaptive delayed GRU + pseudo-label context window"""
+    """TExGAD triple exchange + adaptive delayed GRU + Context-rich GRU inputs"""
 
     def __init__(self, models: List[Model], data: Data, strategy: Strategy,
                  recurrent_model: RecurrentModel, recurrent_start_chapter: int = 3,
@@ -666,9 +666,9 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
                  adaptive_start_window: int = 3,
                  adaptive_start_tolerance: float = 0.003,
                  adaptive_max_wait_chapter: Optional[int] = None,
-                 pseudo_context_window: int = 3,
-                 pseudo_context_min_votes: int = 2,
-                 final_score_blend_grid: Optional[List[float]] = None,       # NEW evening
+                 recurrent_include_raw: bool = False,
+                 recurrent_include_scores: bool = False,
+                 final_score_blend_grid: Optional[List[float]] = None,     
                  **kwargs):
         super().__init__(models=models, data=data, strategy=strategy, **kwargs)
         self.recurrent_model = recurrent_model
@@ -682,16 +682,16 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
         self.adaptive_start_window = adaptive_start_window
         self.adaptive_start_tolerance = adaptive_start_tolerance
         self.adaptive_max_wait_chapter = adaptive_max_wait_chapter
-        self.pseudo_context_window = pseudo_context_window
-        self.pseudo_context_min_votes = pseudo_context_min_votes
+        self.recurrent_include_raw = recurrent_include_raw
+        self.recurrent_include_scores = recurrent_include_scores
 
         self._recurrent_started = False
         self._recurrent_start_actual_chapter = None
         self._val_ensemble_auc_history = []
         self._pseudo_context_history = []
-        self.final_score_blend_grid = final_score_blend_grid or [0.0, 0.25, 0.5, 0.75, 1.0] # NEW evening
-        self._best_blend_alpha = 1.0                                                        # NEW evening
-        self._best_blend_val_auc = -float("inf")                                            # NEW evening
+        self.final_score_blend_grid = final_score_blend_grid or [0.0, 0.25, 0.5, 0.75, 1.0] 
+        self._best_blend_alpha = 1.0                                                        
+        self._best_blend_val_auc = -float("inf")                                            
 
     def _get_embedding_indexes(self) -> Optional[np.ndarray]:
         if not self.embeddings_use_train:
@@ -700,10 +700,29 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
             return self.data.unlabeled_indexes
         return np.arange(self.data.n_train)
 
+    def _collect_raw_features(self, indexes: Optional[np.ndarray],
+                              use_train: bool, use_val: bool) -> np.ndarray:
+        """Return raw features aligned with recurrent embeddings"""
+        if use_val:
+            raw = self.data.X_val
+        elif use_train:
+            raw = self.data.X_train
+            if indexes is not None:
+                raw = raw[np.asarray(indexes)]
+        else:
+            raw = self.data.X_test
+
+        if raw is None:
+            raise ValueError("Raw features are unavailable for recurrent input")
+
+        return np.atleast_2d(np.asarray(raw, dtype=np.float32))
+
     def _collect_embeddings(self, indexes: Optional[np.ndarray],
                             use_train: Optional[bool] = None, use_val: bool = False) -> np.ndarray:
         use_train = self.embeddings_use_train if use_train is None else use_train
-        embeddings = []
+        raw = self._collect_raw_features(indexes, use_train, use_val) if self.recurrent_include_raw else None
+
+        embeddings, scores_list = [], []
         roles = self._resolve_roles()
         ordered_models = [self.models[roles["ud"]], self.models[roles["sd"]], self.models[roles["dd"]]]
 
@@ -716,28 +735,79 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
                 layer=self.embeddings_layer,
                 batch_size=self.embeddings_batch_size,
             )
-            emb = np.atleast_2d(np.asarray(emb))
-            logger.info(f"[{m.__class__.__name__}] Embeddings: {emb.shape}")
+            emb = np.atleast_2d(np.asarray(emb, dtype=np.float32))
             embeddings.append(emb)
 
+            if self.recurrent_include_scores:
+                if use_val:
+                    scores = m.predict_scores(use_val=True)
+                elif use_train:
+                    scores = m.predict_scores(use_train=True)
+                    if indexes is not None:
+                        scores = scores[np.asarray(indexes)]
+                else:
+                    scores = m.predict_scores()
+
+                scores = np.asarray(scores, dtype=np.float32).reshape(-1, 1)
+                if scores.shape[0] != emb.shape[0]:
+                    raise ValueError(f"Score/features length mismatch: scores={scores.shape}, emb={emb.shape}")
+                scores_list.append(scores)
+            else:
+                scores_list.append(None)
+
+            if raw is not None and raw.shape[0] != emb.shape[0]:
+                raise ValueError(f"Raw/features length mismatch: raw={raw.shape}, emb={emb.shape}")
+
+            logger.info(f"[{m.__class__.__name__}] Embeddings: {emb.shape}")
+
         if not embeddings:
-            raise ValueError("No embeddings collected")
+            raise ValueError("No recurrent input collected")
 
         agg = self.embeddings_aggregate
-        if agg == "concat":
-            return np.concatenate(embeddings, axis=1)
-        if agg == "mean":
-            return np.mean(np.stack(embeddings, axis=0), axis=0)
+
         if agg == "stack":
-            max_d = max(e.shape[1] for e in embeddings)
-            padded = [
-                np.pad(e, ((0, 0), (0, max_d - e.shape[1]))) if e.shape[1] < max_d else e
-                for e in embeddings
-            ]
-            shapes = {p.shape for p in padded}
+            max_emb_d = max(e.shape[1] for e in embeddings)
+            steps = []
+
+            for emb, scores in zip(embeddings, scores_list):
+                padded_emb = (
+                    np.pad(emb, ((0, 0), (0, max_emb_d - emb.shape[1])))
+                    if emb.shape[1] < max_emb_d else emb
+                )
+
+                parts = []
+                if raw is not None:
+                    parts.append(raw)
+                parts.append(padded_emb)
+                if scores is not None:
+                    parts.append(scores)
+
+                step = np.concatenate(parts, axis=1)
+                steps.append(step)
+
+            shapes = {s.shape for s in steps}
             if len(shapes) > 1:
                 raise ValueError(f"Shape mismatch for stacking: {shapes}")
-            return np.stack(padded, axis=1)
+
+            recurrent_input = np.stack(steps, axis=1)
+            logger.info(f"[RecurrentInput] shape={recurrent_input.shape}")
+            return recurrent_input
+
+        steps = []
+        for emb, scores in zip(embeddings, scores_list):
+            parts = []
+            if raw is not None:
+                parts.append(raw)
+            parts.append(emb)
+            if scores is not None:
+                parts.append(scores)
+            steps.append(np.concatenate(parts, axis=1))
+
+        if agg == "concat":
+            return np.concatenate(steps, axis=1)
+        if agg == "mean":
+            return np.mean(np.stack(steps, axis=0), axis=0)
+
         raise ValueError(f"Unsupported embeddings_aggregate: {agg}")
 
     def _collect_val_embeddings(self) -> Optional[np.ndarray]:
