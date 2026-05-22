@@ -36,9 +36,11 @@ try:
     gadbench_gnn = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gadbench_gnn)
     BWGNN = gadbench_gnn.BWGNN
+    GraphSAGE = gadbench_gnn.GraphSAGE
     BWGNN_ERROR = None
 except Exception as e:
     BWGNN = None
+    GraphSAGE = None
     BWGNN_ERROR = e
 
 
@@ -48,6 +50,8 @@ def get_model_detector_dict() -> Dict[str, type]:
         "BWGNN": BWGNNWrapper,
         "XGBGraph": XGBGraphWrapper,
         "xgbgraph": XGBGraphWrapper,
+        "graphsage": GraphSAGEWrapper,
+        "GraphSAGE": GraphSAGEWrapper,
     }
 
 
@@ -79,6 +83,7 @@ class _GraphWrapperBase(Model):
         super().__init__(train_config=train_config, model_config=model_config, data=None)
         self.data = data
         self.device = self._resolve_device(self.train_config.get("device", "auto"))
+        self.inductive = bool(self.train_config.get("inductive", False))
         self.graph = self._build_graph(data).to(self.device)
         self.features = self.graph.ndata["feature"]
         self.labels_full = self.graph.ndata["label"].long()
@@ -186,21 +191,14 @@ class _GraphWrapperBase(Model):
         self.y_test = full_y[test]
         self.y_val = None if val is None or len(val) == 0 else full_y[val]
 
-    def _resolved_train_labels(self):
-        labels = torch.full_like(self.labels_full, -1)
-        y_train = np.asarray(self.y_train, dtype=np.int64).copy()
-        labels[self.train_node_idx] = torch.as_tensor(y_train, dtype=torch.long, device=self.device)
-        return labels
-
-    def _known_train_nodes(self):
-        labels = self._resolved_train_labels()
-        mask = torch.isin(labels, torch.tensor([0, 1], device=self.device))
-        nodes = self.train_node_idx[mask[self.train_node_idx]]
-        if nodes.numel() == 0:
-            raise ValueError("No known training labels available")
-        if torch.unique(labels[nodes]).numel() < 2:
-            raise ValueError("GADBench wrappers need both normal and anomaly labels")
-        return nodes, labels[nodes]
+    def _known_train_rows(self):
+        """Train rows with known {0,1} labels (graph-view local when inductive) and labels."""
+        y = torch.as_tensor(np.array(self.y_train), dtype=torch.long, device=self.device)
+        mask = torch.isin(y, torch.tensor([0, 1], device=self.device))
+        if mask.sum() == 0 or torch.unique(y[mask]).numel() < 2:
+            raise ValueError("GADBench wrappers need both normal and anomaly training labels")
+        base = torch.arange(len(y), device=self.device) if self.inductive else self.train_node_idx
+        return base[mask], y[mask]
 
     def _node_indexes(self, indexes=None, use_train: bool = False, use_val: bool = False):
         nodes = self.train_node_idx if use_train else (self.val_node_idx if use_val else self.test_node_idx)
@@ -227,40 +225,54 @@ class _GraphWrapperBase(Model):
 
 
 class BWGNNWrapper(_GraphWrapperBase):
-    """BWGNN node anomaly detector."""
+    """BWGNN node anomaly detector (transductive: trained on the full graph)."""
+    _gnn = BWGNN
+    _inductive_default = False
+    _gnn_cfg = {"h_feats": 32, "num_classes": 2, "num_layers": 2,
+                "mlp_layers": 2, "dropout_rate": 0.0, "activation": "ReLU"}
 
     def __init__(self, train_config: dict, model_config: dict, data):
         if BWGNN_ERROR is not None:
-            raise ImportError("Could not import GADBench BWGNN") from BWGNN_ERROR
-        defaults = {"seed": 42, "total_epochs": 100, "lr": 0.01, "weight_decay": 0.0, "device": "auto"}
+            raise ImportError("Could not import GADBench GNN models") from BWGNN_ERROR
+        defaults = {"seed": 42, "total_epochs": 100, "lr": 0.01, "weight_decay": 0.0,
+                    "device": "auto", "inductive": self._inductive_default}
         config = {**defaults, **(train_config or {})}
         super().__init__(train_config=config, model_config=model_config or {}, data=data)
         _set_seed(self.train_config["seed"])
-        cfg = self._model_defaults()
-        self.model = BWGNN(**cfg).to(self.device)
+        self.train_graph, self.eval_graph, self._val_rows = self._graph_views()
+        self.model = self._gnn(**self._model_defaults()).to(self.device)
         self.optimizer = torch.optim.Adam(
             self.model.parameters(), lr=self.train_config["lr"],
             weight_decay=self.train_config["weight_decay"],
         )
 
+    def _graph_views(self):
+        """Train/eval graph views; inductive runs hide held-out nodes via node subgraphs."""
+        if not self.inductive:
+            return self.graph, self.graph, self.val_node_idx
+        train_graph = dgl.node_subgraph(self.graph, self.train_node_idx)
+        if self.val_node_idx is None or self.val_node_idx.numel() == 0:
+            return train_graph, train_graph, self.val_node_idx
+        eval_graph = dgl.node_subgraph(self.graph, torch.cat([self.train_node_idx, self.val_node_idx]))
+        n_train, n_val = self.train_node_idx.numel(), self.val_node_idx.numel()
+        return train_graph, eval_graph, torch.arange(n_train, n_train + n_val, device=self.device)
+
     def _model_defaults(self) -> dict:
-        cfg = {
-            "in_feats": self.features.shape[1], "h_feats": 32, "num_classes": 2,
-            "num_layers": 2, "mlp_layers": 2, "dropout_rate": 0.0, "activation": "ReLU",
-        }
+        cfg = {"in_feats": self.features.shape[1], **self._gnn_cfg}
         cfg.update({**self.train_config, **self.model_config})
         if "drop_rate" in cfg and "dropout_rate" not in self.model_config:
             cfg["dropout_rate"] = cfg.pop("drop_rate")
-        for key in ("model", "lr", "seed", "total_epochs", "weight_decay", "device", "add_self_loop"):
+        for key in ("model", "lr", "seed", "total_epochs", "weight_decay",
+                    "device", "add_self_loop", "inductive"):
             cfg.pop(key, None)
         return cfg
 
     def train(self, epochs: int = 1) -> None:
         for _ in range(epochs):
-            nodes, labels = self._known_train_nodes()
+            rows, labels = self._known_train_rows()
             self.model.train()
-            logits = self.model(self.graph)
-            loss = F.cross_entropy(logits[nodes], labels, weight=self._class_weight(labels))
+            logits = self.model(self.train_graph)[rows]
+            loss = F.cross_entropy(logits, labels, weight=self._class_weight(labels))
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
@@ -272,15 +284,16 @@ class BWGNNWrapper(_GraphWrapperBase):
         self._last_train_loss = train_loss
         self._train_loss_history.append(train_loss)
         if self.val_node_idx is not None and self.val_node_idx.numel() > 0:
-            val_loss = self._compute_loss(self.val_node_idx, self.labels_full[self.val_node_idx])
+            val_loss = self._compute_loss()
             self._last_val_loss = val_loss
             self._val_loss_history.append(val_loss)
 
-    def _compute_loss(self, nodes, labels) -> float:
+    def _compute_loss(self) -> float:
+        """Validation cross-entropy on the eval graph view (train+val nodes when inductive)."""
         self.model.eval()
         with torch.no_grad():
-            logits = self.model(self.graph)
-            return float(F.cross_entropy(logits[nodes], labels).detach().cpu())
+            logits = self.model(self.eval_graph)[self._val_rows]
+            return float(F.cross_entropy(logits, self.labels_full[self.val_node_idx]).detach().cpu())
 
     def _logits(self, nodes):
         self.model.eval()
@@ -302,8 +315,61 @@ class BWGNNWrapper(_GraphWrapperBase):
         return self._logits(nodes).detach().cpu().numpy()
 
 
+class GraphSAGEWrapper(BWGNNWrapper):
+    """GraphSAGE detector: inductive minibatch training with neighbor sampling (Hamilton et al., 2017)."""
+    _gnn = GraphSAGE
+    _inductive_default = True
+    _gnn_cfg = {"h_feats": 32, "num_classes": 2, "num_layers": 2,
+                "agg": "pool", "dropout_rate": 0.0, "activation": "ReLU"}
+
+    def __init__(self, train_config: dict, model_config: dict, data):
+        super().__init__(train_config, model_config, data)
+        self._sampler, self._batch_size = self._build_sampler()
+
+    def _build_sampler(self):
+        """Neighbor sampler with one fanout per GNN layer (paper default S1=25, S2=10)."""
+        params = {**self.train_config, **self.model_config}
+        n_layers = len(self.model.layers)
+        fanout = params.get("fanout", [25, 10])
+        fanout = [int(fanout)] * n_layers if isinstance(fanout, int) else [int(f) for f in fanout]
+        if len(fanout) != n_layers:
+            raise ValueError(f"fanout needs one value per GNN layer ({n_layers})")
+        return dgl.dataloading.NeighborSampler(fanout), int(params.get("batch_size", 512))
+
+    def train(self, epochs: int = 1) -> None:
+        rows, labels = self._known_train_rows()
+        weight = self._class_weight(labels)
+        label_vec = torch.full((self.train_graph.num_nodes(),), -1, dtype=torch.long, device=self.device)
+        label_vec[rows] = labels
+        loader = dgl.dataloading.DataLoader(
+            self.train_graph, rows, self._sampler, batch_size=self._batch_size,
+            shuffle=True, drop_last=False, device=self.device)
+        for _ in range(epochs):
+            self.model.train()
+            epoch_loss, n_seeds = 0.0, 0
+            for input_nodes, output_nodes, blocks in loader:
+                logits = self._forward_blocks(input_nodes, blocks)
+                loss = F.cross_entropy(logits, label_vec[output_nodes], weight=weight)
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                epoch_loss += float(loss.detach().cpu()) * len(output_nodes)
+                n_seeds += len(output_nodes)
+            self._current_epoch += 1
+            self._fitted = True
+            self._record_losses(epoch_loss / max(n_seeds, 1))
+
+    def _forward_blocks(self, input_nodes, blocks):
+        """Forward SAGEConv layers along the sampled message-flow blocks."""
+        h = self.train_graph.ndata["feature"][input_nodes]
+        for layer, block in zip(self.model.layers, blocks):
+            h = layer(block, self.model.dropout(h))
+        return self.model.output_linear(h)
+
+
 class XGBGraphWrapper(_GraphWrapperBase):
     """XGBoost on graph-aggregated node features."""
+    epoch_friendly = False
 
     def __init__(self, train_config: dict, model_config: dict, data):
         if XGBOOST_ERROR is not None:
@@ -352,17 +418,21 @@ class XGBGraphWrapper(_GraphWrapperBase):
                 raise ValueError("agg must be one of: mean, sum, max")
             return self.graph.ndata["h"]
 
+    def fit(self) -> None:
+        if not self._fitted:
+            self.train(1)
+        self._fitted = True
+
     def train(self, epochs: int = 1) -> None:
-        for _ in range(epochs):
-            nodes, labels = self._known_train_nodes()
-            idx = nodes.detach().cpu().numpy()
-            y = labels.detach().cpu().numpy()
-            weights = np.where(y == 0, 1.0, max(1.0, np.sum(y == 0) / max(np.sum(y == 1), 1)))
-            self.model = self._build_model()
-            self.model.fit(self.X_graph[idx], y, sample_weight=weights, verbose=False)
-            self._current_epoch += 1
-            self._fitted = True
-            self._record_losses()
+        nodes, labels = self._known_train_rows()
+        idx = nodes.detach().cpu().numpy()
+        y = labels.detach().cpu().numpy()
+        weights = np.where(y == 0, 1.0, max(1.0, np.sum(y == 0) / max(np.sum(y == 1), 1)))
+        self.model = self._build_model()
+        self.model.fit(self.X_graph[idx], y, sample_weight=weights, verbose=False)
+        self._current_epoch += 1
+        self._fitted = True
+        self._record_losses()
 
     def _record_losses(self) -> None:
         train_loss = self._compute_loss(self.train_node_idx.detach().cpu().numpy(), self.y_train)

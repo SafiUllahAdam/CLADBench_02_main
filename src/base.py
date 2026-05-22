@@ -24,6 +24,7 @@ def default_arbiter(proposals: List[PseudoLabelProposal]) -> Optional[int]:
 
 class Model(ABC):
     """Base anomaly detector"""
+    epoch_friendly = True
 
     def __init__(self, train_config: Optional[Dict] = None,
                  model_config: Optional[Dict] = None,
