@@ -1,3 +1,5 @@
+import torch
+import torch.nn as nn
 import copy
 from typing import Optional, List
 
@@ -37,7 +39,6 @@ class GRURecurrentModel(RecurrentModel):
         # NEW 
         self._best_val_auc = -float("inf")
         self._best_state = None
-        self._invert = False
         # NEW
         
         if seed is not None:
@@ -66,7 +67,6 @@ class GRURecurrentModel(RecurrentModel):
         self._input_size = input_size
         self._best_val_auc = -float("inf")
         self._best_state = None
-        self._invert = False
         
     def _prepare_batch(self, embeddings: np.ndarray, labels: Optional[np.ndarray] = None):
         x = np.asarray(embeddings, dtype=np.float32)
@@ -143,7 +143,7 @@ class GRURecurrentModel(RecurrentModel):
         if val_auc is None or not np.isfinite(val_auc):
             return False
 
-        effective_auc = max(float(val_auc), 1.0 - float(val_auc))
+        effective_auc = float(val_auc)
         if effective_auc <= self._best_val_auc:
             return False
 
@@ -151,7 +151,6 @@ class GRURecurrentModel(RecurrentModel):
         self._best_state = {
             "gru": copy.deepcopy(self._gru.state_dict()),
             "classifier": copy.deepcopy(self._classifier.state_dict()),
-            "invert": float(val_auc) < 0.5,
         }
         return True
 
@@ -161,7 +160,6 @@ class GRURecurrentModel(RecurrentModel):
 
         self._gru.load_state_dict(self._best_state["gru"])
         self._classifier.load_state_dict(self._best_state["classifier"])
-        self._invert = bool(self._best_state["invert"])
         return True
     
     def train(self, aggregated_embeddings: np.ndarray, labels: np.ndarray,
@@ -203,5 +201,92 @@ class GRURecurrentModel(RecurrentModel):
         self._gru.eval()
         self._classifier.eval()
         with torch.no_grad():
-            scores = torch.sigmoid(self._forward(x)).cpu().numpy().astype(np.float32).ravel()
-        return (1.0 - scores).astype(np.float32) if self._invert else scores
+            return torch.sigmoid(self._forward(x)).cpu().numpy().astype(np.float32).ravel()
+    
+    
+    
+class LSTMRecurrentModel(GRURecurrentModel):
+    """LSTM recurrent judge with the same API as GRURecurrentModel"""
+
+    def _build(self, input_size: int) -> None:
+        self._input_size = input_size
+        self._gru = nn.LSTM(
+            input_size=input_size,
+            hidden_size=self.hidden_size,
+            num_layers=self.num_layers,
+            batch_first=True,
+            dropout=self.dropout if self.num_layers > 1 else 0.0,
+            bidirectional=False,
+        ).to(self.device)
+
+        self._classifier = nn.Linear(self.hidden_size, 1).to(self.device)
+
+        params = list(self._gru.parameters()) + list(self._classifier.parameters())
+        self._optimizer = torch.optim.Adam(
+            params,
+            lr=self.lr,
+            weight_decay=getattr(self, "weight_decay", 0.0),
+        )
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, (h_n, _) = self._gru(x)
+        h = h_n[-1]
+        return self._classifier(h).squeeze(-1)
+    
+    
+    
+class SlidingWindowLSTMRecurrentModel(LSTMRecurrentModel):
+    """LSTM judge: one continuous pass, sliding-window read, max-pool over windows"""
+
+    def __init__(self, *args, window_size: int = 6, stride: int = 3, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.window_size = window_size
+        self.stride = stride
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self._gru(x)                                  # one continuous pass, hidden flows whole sequence
+        seq_len = out.size(1)
+        if seq_len < self.window_size:
+            return self._classifier(out[:, -1]).squeeze(-1)    # short sequence: score final continuous state
+        starts = range(0, seq_len - self.window_size + 1, self.stride)
+        logits = [self._classifier(out[:, s + self.window_size - 1]) for s in starts]  # window-end state, full prior context
+        return torch.stack(logits, dim=1).squeeze(-1).max(dim=1).values                # strongest window, no dilution
+
+
+class _DeepSetsPool(nn.Module):
+    """Per-detector MLP then permutation-invariant pooling (mean or attention)"""
+
+    def __init__(self, input_size: int, hidden_size: int, dropout: float = 0.0, pool: str = "attention"):
+        super().__init__()
+        self.pool = pool
+        self.phi = nn.Sequential(nn.Linear(input_size, hidden_size), nn.ReLU(),
+                                 nn.Dropout(dropout),
+                                 nn.Linear(hidden_size, hidden_size), nn.ReLU())
+        self.attn = nn.Linear(hidden_size, 1) if pool == "attention" else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.phi(x)                                    # [B, n_detectors, H] per-detector encoding
+        if self.pool == "mean":
+            return h.mean(dim=1)                           # permutation-invariant mean
+        w = torch.softmax(self.attn(h), dim=1)             # [B, n_detectors, 1] attention over detectors
+        return (w * h).sum(dim=1)                          # weighted permutation-invariant sum
+
+
+class PermInvariantModel(GRURecurrentModel):
+    """Permutation-invariant judge: per-detector MLP + mean/attention pooling (DeepSets)"""
+
+    def __init__(self, *args, pool: str = "attention", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pool = pool
+
+    def _build(self, input_size: int) -> None:
+        self._gru = _DeepSetsPool(input_size, self.hidden_size, self.dropout, self.pool).to(self.device)
+        self._classifier = nn.Linear(self.hidden_size, 1).to(self.device)
+        self._optimizer = torch.optim.Adam(
+            list(self._gru.parameters()) + list(self._classifier.parameters()), lr=self.lr)
+        self._input_size = input_size
+        self._best_val_auc = -float("inf")
+        self._best_state = None
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._classifier(self._gru(x)).squeeze(-1)  # pool over detectors then score

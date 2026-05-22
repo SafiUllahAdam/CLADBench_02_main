@@ -472,7 +472,8 @@ class BasicAdaptiveCoLearner(CoLearnerVal):
 
     def __init__(self, *args, purification_ratio: float = 0.20,
                  purification_ratio_anomaly: Optional[float] = None,
-                 purification_ratio_normal: Optional[float] = None, **kwargs):
+                 purification_ratio_normal: Optional[float] = None,
+                 specialist_forgetting: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         if len(self.models) != 3:
             raise ValueError("BasicAdaptiveCoLearner requires exactly 3 models: UD, SD, DD")
@@ -484,7 +485,7 @@ class BasicAdaptiveCoLearner(CoLearnerVal):
         self.purification_ratio_normal = (
             purification_ratio if purification_ratio_normal is None else purification_ratio_normal
         )
-
+        self.specialist_forgetting = specialist_forgetting
         self.model_scores = {f"model_{i}": None for i in range(len(self.models))}
         self.ensemble_scores = None
         self.ensemble_disagreement = None
@@ -526,6 +527,42 @@ class BasicAdaptiveCoLearner(CoLearnerVal):
         denom = np.sum(confidence, axis=0)
         denom[denom == 0.0] = 1.0
         return np.sum(weighted, axis=0) / denom
+
+    def _apply_specialist_forgetting(self, exch_idx, stats):
+        """Keep each anomaly pseudo-label for one receiver only"""
+        if not self.specialist_forgetting:
+            return
+
+        score_mat = np.vstack([
+            self.model_scores[f"model_{i}"] for i in range(len(self.models))
+        ])
+
+        owned, forgotten = 0, 0
+
+        for idx in np.asarray(exch_idx, dtype=int):
+            receivers = []
+
+            for r, m in enumerate(self.models):
+                pseudo = getattr(m, "_pseudo_labels", None)
+                if pseudo is not None and pseudo[idx] == 1:
+                    receivers.append(r)
+
+            if len(receivers) <= 1:
+                continue
+
+            owner = receivers[int(np.argmax(score_mat[receivers, idx]))]
+            owned += 1
+
+            for r in receivers:
+                if r == owner:
+                    continue
+                self.models[r]._pseudo_labels[idx] = -1
+                if hasattr(self.models[r], "_y_train_cache"):
+                    self.models[r]._y_train_cache = None
+                forgotten += 1
+
+        stats["specialist_owned_anomalies"] = owned
+        stats["specialist_forgotten_anomaly_labels"] = forgotten
 
     def _send_pair(self, sender, receiver, exch_idx, stats):
         """Send purified pseudo-labels from sender to receiver"""
@@ -589,8 +626,9 @@ class BasicAdaptiveCoLearner(CoLearnerVal):
             for receiver in receivers:
                 self._send_pair(sender, receiver, exch_idx, stats)
 
-        self.exchange_history.append(stats)
         self._finalize_pseudo_labels()
+        self._apply_specialist_forgetting(exch_idx, stats)
+        self.exchange_history.append(stats)
 
         all_sc = np.array(list(self.model_scores.values()))
         self.ensemble_scores = self._adaptive_ensemble_scores(all_sc)
@@ -668,7 +706,8 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
                  adaptive_max_wait_chapter: Optional[int] = None,
                  recurrent_include_raw: bool = False,
                  recurrent_include_scores: bool = False,
-                 final_score_blend_grid: Optional[List[float]] = None,     
+                 final_score_blend_grid: Optional[List[float]] = None,
+                 recurrent_token_sequence: bool = False,   
                  **kwargs):
         super().__init__(models=models, data=data, strategy=strategy, **kwargs)
         self.recurrent_model = recurrent_model
@@ -684,6 +723,7 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
         self.adaptive_max_wait_chapter = adaptive_max_wait_chapter
         self.recurrent_include_raw = recurrent_include_raw
         self.recurrent_include_scores = recurrent_include_scores
+        self.recurrent_token_sequence = recurrent_token_sequence
 
         self._recurrent_started = False
         self._recurrent_start_actual_chapter = None
@@ -700,6 +740,7 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
             return self.data.unlabeled_indexes
         return np.arange(self.data.n_train)
 
+# NEW collects X_train/X_val/X_test.
     def _collect_raw_features(self, indexes: Optional[np.ndarray],
                               use_train: bool, use_val: bool) -> np.ndarray:
         """Return raw features aligned with recurrent embeddings"""
@@ -716,7 +757,55 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
             raise ValueError("Raw features are unavailable for recurrent input")
 
         return np.atleast_2d(np.asarray(raw, dtype=np.float32))
+# NEW This builds: Raw1, E1, S1, Raw2, E2, S2, Raw3, E3, S3     Shape becomes:[n_samples, 9, token_dim]
+    def _pad_features(self, x: np.ndarray, width: int) -> np.ndarray:
+        """Pad features to a fixed width"""
+        if x.shape[1] > width:
+            raise ValueError(f"Cannot pad width {x.shape[1]} to smaller width {width}")
+        if x.shape[1] == width:
+            return x
+        return np.pad(x, ((0, 0), (0, width - x.shape[1])))
 
+    def _token_marker(self, n: int, token_type: int, role: int) -> np.ndarray:
+        """Build token type and detector role markers"""
+        marker = np.zeros((n, 6), dtype=np.float32)
+        marker[:, token_type] = 1.0
+        marker[:, 3 + role] = 1.0
+        return marker
+
+    def _collect_token_sequence_input(self, raw, embeddings, scores_list) -> np.ndarray:
+        """Build repeated raw/embedding/score token sequence"""
+        if raw is None:
+            raise ValueError("recurrent_token_sequence=True requires recurrent_include_raw=True")
+        if any(scores is None for scores in scores_list):
+            raise ValueError("recurrent_token_sequence=True requires recurrent_include_scores=True")
+
+        n = raw.shape[0]
+        body_d = max([raw.shape[1], 1] + [e.shape[1] for e in embeddings])
+        tokens = []
+
+        for role_idx, (emb, scores) in enumerate(zip(embeddings, scores_list)):
+            raw_token = np.concatenate(
+                [self._pad_features(raw, body_d), self._token_marker(n, 0, role_idx)],
+                axis=1,
+            )
+            emb_token = np.concatenate(
+                [self._pad_features(emb, body_d), self._token_marker(n, 1, role_idx)],
+                axis=1,
+            )
+            score_token = np.concatenate(
+                [self._pad_features(scores, body_d), self._token_marker(n, 2, role_idx)],
+                axis=1,
+            )
+
+            tokens.extend([raw_token, emb_token, score_token])
+
+        recurrent_input = np.stack(tokens, axis=1)
+        logger.info(f"[TokenSequenceInput] shape={recurrent_input.shape}")
+        return recurrent_input
+
+
+# builds each GRU step as [raw | padded embedding | score], then stacks to [n_samples, 3, feat_dim]
     def _collect_embeddings(self, indexes: Optional[np.ndarray],
                             use_train: Optional[bool] = None, use_val: bool = False) -> np.ndarray:
         use_train = self.embeddings_use_train if use_train is None else use_train
@@ -760,8 +849,14 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
 
             logger.info(f"[{m.__class__.__name__}] Embeddings: {emb.shape}")
 
+# NEW 
         if not embeddings:
             raise ValueError("No recurrent input collected")
+
+        if self.recurrent_token_sequence:
+            if self.embeddings_aggregate != "stack":
+                raise ValueError("recurrent_token_sequence=True supports only embeddings_aggregate='stack'")
+            return self._collect_token_sequence_input(raw, embeddings, scores_list)
 
         agg = self.embeddings_aggregate
 
@@ -971,11 +1066,8 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
             val_emb = self._collect_val_embeddings()
             if val_emb is not None:
                 try:
-                    raw_auc = roc_auc_score(y_val, self.recurrent_model.predict_scores(val_emb))
-                    metrics["gru_raw"] = raw_auc
-                    metrics["gru"] = max(raw_auc, 1.0 - raw_auc)
+                    metrics["gru"] = roc_auc_score(y_val, self.recurrent_model.predict_scores(val_emb))
                 except Exception:
-                    metrics["gru_raw"] = 0.5
                     metrics["gru"] = 0.5
 
         return metrics
@@ -1086,8 +1178,8 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
             if self._should_start_recurrent(ch) or self._recurrent_started:
                 self._train_recurrent(ch)
                 metrics = self._evaluate_with_gru(y_val, ch)
-                if "gru_raw" in metrics:
-                    improved = self.recurrent_model.update_best(metrics["gru_raw"])
+                if "gru" in metrics:
+                    improved = self.recurrent_model.update_best(metrics["gru"])
                     if improved:
                         logger.info(
                             f"[Recurrent] New best val AUC={metrics['gru']:.4f} "
