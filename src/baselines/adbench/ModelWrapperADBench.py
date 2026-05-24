@@ -328,6 +328,7 @@ class DeepSADWrapper(Model):
             self._pretrained = True
 
         self.trainer = None
+        self._optimizer = None
         self._train_loss_history = []
         self._val_loss_history = []
         self._last_train_loss = None
@@ -338,6 +339,28 @@ class DeepSADWrapper(Model):
         if remaining > 0:
             self.train(remaining)
         self._fitted = True
+
+    def _train_one_epoch(self) -> None:
+        """One DeepSAD epoch with a persistent optimizer so Adam momentum survives across epochs"""
+        net = self.deepsad.net.to(self.device)
+        if self._optimizer is None:
+            self._optimizer = torch.optim.Adam(net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        loader = self.dataset.loaders(batch_size=self.batch_size, num_workers=0)
+        if self.trainer.c is None:
+            self.trainer.c = self.trainer.init_center_c(loader, net)
+        c, eta, eps = self.trainer.c, self.train_config["eta"], self.trainer.eps
+        net.train()
+        for inputs, _, semi_targets, _ in loader:
+            inputs, semi_targets = inputs.to(self.device), semi_targets.to(self.device)
+            semi_targets[semi_targets == 1] = -1
+            self._optimizer.zero_grad()
+            outputs = net(inputs)
+            dist = torch.sum((outputs - c) ** 2, dim=1)
+            losses = torch.where(semi_targets == 0, dist, eta * ((dist + eps) ** semi_targets.float()))
+            torch.mean(losses).backward()
+            self._optimizer.step()
+        self.deepsad.net = net
+        self.deepsad.c = c.cpu().data.numpy().tolist()
 
     def train(self, epochs: int = 1) -> None:
         y_train = self.y_train
@@ -359,8 +382,7 @@ class DeepSADWrapper(Model):
             )
 
         for _ in range(epochs):
-            self.deepsad.net = self.trainer.train(self.dataset, self.deepsad.net)
-            self.deepsad.c = self.trainer.c.cpu().data.numpy().tolist()
+            self._train_one_epoch()
             self._current_epoch += 1
             self._fitted = True
 
