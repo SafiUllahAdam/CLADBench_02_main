@@ -6,6 +6,7 @@ from typing import Optional, List
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from base import RecurrentModel
 
@@ -16,7 +17,9 @@ class GRURecurrentModel(RecurrentModel):
     def __init__(self, hidden_size: int = 128, num_layers: int = 1, dropout: float = 0.0,
                  lr: float = 1e-3, batch_size: int = 256, num_epochs: int = 50,
                  seed: Optional[int] = None, max_grad_norm: float = 1.0,
-                 n_detectors: Optional[int] = None, device: Optional[str] = None):
+                 n_detectors: Optional[int] = None, device: Optional[str] = None,
+                 use_pos_weight: bool = True):
+        self.use_pos_weight = use_pos_weight
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.dropout = dropout
@@ -101,14 +104,21 @@ class GRURecurrentModel(RecurrentModel):
     def _train_epochs(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor,
                     epochs: int, x_val: Optional[torch.Tensor] = None,
                     y_val: Optional[torch.Tensor] = None,
-                    mask_val: Optional[torch.Tensor] = None) -> None:
+                    mask_val: Optional[torch.Tensor] = None,
+                    weights: Optional[torch.Tensor] = None) -> None:
         xl, yl = x[mask], y[mask]
+        wl = weights[mask] if weights is not None else None
         n = xl.size(0)
         if n == 0:
             return
         if len(torch.unique(yl)) < 2:
             return
         params = list(self._gru.parameters()) + list(self._classifier.parameters())
+        pw = None
+        if self.use_pos_weight:
+            n_pos = float((yl > 0.5).sum().item())                      # soft-label aware positive count
+            if 0.0 < n_pos < n:
+                pw = torch.tensor((n - n_pos) / n_pos, device=self.device)
 
         for _ in range(max(1, epochs)):
             self._gru.train()
@@ -118,7 +128,12 @@ class GRURecurrentModel(RecurrentModel):
             for start in range(0, n, self.batch_size):
                 idx = perm[start:start + self.batch_size]
                 logits = self._forward(xl[idx])
-                loss = self._criterion(logits, yl[idx])
+                per = F.binary_cross_entropy_with_logits(logits, yl[idx], pos_weight=pw, reduction="none")
+                if wl is not None:
+                    w = wl[idx]
+                    loss = (per * w).sum() / (w.sum() + 1e-9)           # per-sample reliability weighting
+                else:
+                    loss = per.mean()
                 self._optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, max_norm=self.max_grad_norm)
@@ -164,14 +179,16 @@ class GRURecurrentModel(RecurrentModel):
     
     def train(self, aggregated_embeddings: np.ndarray, labels: np.ndarray,
               epochs: int = 1, val_embeddings: Optional[np.ndarray] = None,
-              val_labels: Optional[np.ndarray] = None) -> None:
+              val_labels: Optional[np.ndarray] = None,
+              weights: Optional[np.ndarray] = None) -> None:
         x, y, mask = self._prepare_batch(aggregated_embeddings, labels)
         if y is None or mask is None:
             return
+        w = torch.as_tensor(np.asarray(weights, dtype=np.float32), device=self.device) if weights is not None else None
         xv, yv, mv = (None, None, None)
         if val_embeddings is not None and val_labels is not None:
             xv, yv, mv = self._prepare_batch(val_embeddings, val_labels)
-        self._train_epochs(x, y, mask, epochs, xv, yv, mv)
+        self._train_epochs(x, y, mask, epochs, xv, yv, mv, weights=w)
 
     def fit(self, aggregated_embeddings: np.ndarray, labels: np.ndarray) -> None:
         self.train(aggregated_embeddings, labels, epochs=self.num_epochs)

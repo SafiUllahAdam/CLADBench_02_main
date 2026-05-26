@@ -473,7 +473,14 @@ class BasicAdaptiveCoLearner(CoLearnerVal):
     def __init__(self, *args, purification_ratio: float = 0.20,
                  purification_ratio_anomaly: Optional[float] = None,
                  purification_ratio_normal: Optional[float] = None,
-                 specialist_forgetting: bool = False, **kwargs):
+                 specialist_forgetting: bool = False,
+                 gate_enabled: bool = True,
+                 gate_target_precision_anomaly: float = 0.6,
+                 gate_target_precision_normal: float = 0.9,
+                 gate_precision_margin: float = 0.05,
+                 gate_min_support: int = 5,
+                 use_reliability_arbiter: bool = True,
+                 arbiter_min_margin: float = 0.2, **kwargs):
         super().__init__(*args, **kwargs)
         if len(self.models) != 3:
             raise ValueError("BasicAdaptiveCoLearner requires exactly 3 models: UD, SD, DD")
@@ -486,6 +493,16 @@ class BasicAdaptiveCoLearner(CoLearnerVal):
             purification_ratio if purification_ratio_normal is None else purification_ratio_normal
         )
         self.specialist_forgetting = specialist_forgetting
+        self.gate_enabled = gate_enabled
+        self.gate_target_precision_anomaly = gate_target_precision_anomaly
+        self.gate_target_precision_normal = gate_target_precision_normal
+        self.gate_precision_margin = gate_precision_margin
+        self.gate_min_support = gate_min_support
+        self.use_reliability_arbiter = use_reliability_arbiter
+        self.arbiter_min_margin = arbiter_min_margin
+        self._reliability: Dict[int, Dict[int, float]] = {}
+        if use_reliability_arbiter and gate_enabled:
+            self.pseudo_label_arbiter = self._reliability_weighted_arbiter
         self.model_scores = {f"model_{i}": None for i in range(len(self.models))}
         self.ensemble_scores = None
         self.ensemble_disagreement = None
@@ -564,11 +581,57 @@ class BasicAdaptiveCoLearner(CoLearnerVal):
         stats["specialist_owned_anomalies"] = owned
         stats["specialist_forgotten_anomaly_labels"] = forgotten
 
+    @staticmethod
+    def _calibrate_threshold(scores, y, side, target_precision, min_support):
+        """Most inclusive cutoff clearing target precision plus its achieved precision, else abstain"""
+        s, y = np.asarray(scores, dtype=float), np.asarray(y)
+        order = np.argsort(-s) if side == "high" else np.argsort(s)
+        hits = (y[order] == 1) if side == "high" else (y[order] == 0)
+        n = np.arange(1, s.size + 1)
+        precision = np.cumsum(hits) / n
+        ok = np.where((precision >= target_precision) & (n >= min_support))[0]
+        if ok.size == 0:
+            return (float("inf") if side == "high" else float("-inf")), 0.0
+        k = ok[-1]
+        return float(s[order][k]), float(precision[k])
+
+    def _calibrate_gate(self) -> None:
+        """Set each detector's exchange thresholds from validation precision; abstain if unreliable"""
+        if not self.gate_enabled or self.data.X_val is None or self.data.y_val is None:
+            return
+        y = np.asarray(self.data.y_val)
+        target_high = max(self.gate_target_precision_anomaly, float(np.mean(y == 1)) + self.gate_precision_margin)
+        target_low = max(self.gate_target_precision_normal, float(np.mean(y == 0)) + self.gate_precision_margin)
+        for i, m in enumerate(self.models):
+            s = m.predict_scores(use_val=True)
+            m.default_confidence_high, anom_prec = self._calibrate_threshold(s, y, "high", target_high, self.gate_min_support)
+            m.default_confidence_low, norm_prec = self._calibrate_threshold(s, y, "low", target_low, self.gate_min_support)
+            self._reliability[i] = {1: anom_prec, 0: norm_prec}
+            logger.info(f"[Gate] {m.__class__.__name__} high={m.default_confidence_high:.3f} "
+                        f"low={m.default_confidence_low:.3f} | rel(a/n)={anom_prec:.2f}/{norm_prec:.2f}")
+
+    def _reliability_weighted_arbiter(self, proposals):
+        """Resolve pseudo-label by votes weighted by sender validation precision; abstain if weak/split"""
+        if not proposals:
+            return None
+        w = {0: 0.0, 1: 0.0}
+        for p in proposals:
+            w[p.label] += self._reliability.get(p.sender_idx, {}).get(p.label, 0.0) * p.confidence
+        total = w[0] + w[1]
+        if total <= 0.0:
+            return None
+        winner = 1 if w[1] > w[0] else 0
+        if (w[winner] - w[1 - winner]) / total < self.arbiter_min_margin:
+            return None
+        return winner
+
     def _send_pair(self, sender, receiver, exch_idx, stats):
         """Send purified pseudo-labels from sender to receiver"""
         sc = self.model_scores[f"model_{sender}"]
-        anom = exch_idx[sc[exch_idx] >= self.confidence_threshold_high]
-        norm = exch_idx[sc[exch_idx] <= self.confidence_threshold_low]
+        thr_high = self._resolve_threshold(sender, receiver, "high")
+        thr_low = self._resolve_threshold(sender, receiver, "low")
+        anom = exch_idx[sc[exch_idx] >= thr_high]
+        norm = exch_idx[sc[exch_idx] <= thr_low]
 
         anom = self._purify_indexes(anom, sc, label=1)
         norm = self._purify_indexes(norm, sc, label=0)
@@ -621,6 +684,8 @@ class BasicAdaptiveCoLearner(CoLearnerVal):
 
         for i, m in enumerate(self.models):
             self.model_scores[f"model_{i}"] = m.predict_scores(use_train=True)
+
+        self._calibrate_gate()
 
         for sender, receivers in [(ud, [sd, dd]), (sd, [ud, dd]), (dd, [ud, sd])]:
             for receiver in receivers:
@@ -707,7 +772,8 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
                  recurrent_include_raw: bool = False,
                  recurrent_include_scores: bool = False,
                  final_score_blend_grid: Optional[List[float]] = None,
-                 recurrent_token_sequence: bool = False,   
+                 recurrent_token_sequence: bool = False,
+                 use_soft_targets: bool = True,
                  **kwargs):
         super().__init__(models=models, data=data, strategy=strategy, **kwargs)
         self.recurrent_model = recurrent_model
@@ -724,6 +790,7 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
         self.recurrent_include_raw = recurrent_include_raw
         self.recurrent_include_scores = recurrent_include_scores
         self.recurrent_token_sequence = recurrent_token_sequence
+        self.use_soft_targets = use_soft_targets
 
         self._recurrent_started = False
         self._recurrent_start_actual_chapter = None
@@ -986,19 +1053,52 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
         logger.info(f"[PseudoContext] kept {len(keep)} recurrent labels from current chapter only")
         return keep, labels[keep]
 
+    def _recurrent_soft_targets(self, indexes):
+        """Real labels at full weight; pseudo-labels softened and weighted by detector reliability"""
+        keep, labels = self._resolve_context_recurrent_targets(indexes)
+        if keep is None or labels is None or len(keep) == 0:
+            return keep, labels, None
+        if not self.use_soft_targets or not self._reliability:
+            return keep, np.asarray(labels, dtype=np.float32), None
+
+        real_mask = np.zeros(self.data.n_train, dtype=bool)
+        labeled = getattr(self.data, "labeled_indexes", None)
+        if labeled is not None and len(labeled):
+            real_mask[labeled] = True
+
+        soft = np.asarray(labels, dtype=np.float32).copy()
+        weights = np.ones(len(keep), dtype=np.float32)
+        for j, idx in enumerate(keep):
+            if real_mask[idx]:
+                continue
+            c = int(round(float(labels[j])))
+            rels = [self._reliability.get(s, {}).get(c, 0.0)
+                    for s, m in enumerate(self.models)
+                    if m._pseudo_labels is not None and m._pseudo_labels[idx] == c]
+            r = float(np.mean(rels)) if rels else 0.0
+            soft[j] = 0.5 + (c - 0.5) * r        # low reliability -> target toward 0.5
+            weights[j] = r                        # low reliability -> low loss weight
+        return keep, soft, weights
+
     def _train_recurrent(self, chapter: int) -> None:
         indexes = self._get_embedding_indexes()
-        indexes, labels = self._resolve_context_recurrent_targets(indexes)
+        indexes, labels, weights = self._recurrent_soft_targets(indexes)
 
         if labels is None or indexes is None or len(indexes) == 0:
             logger.warning("[Recurrent] No stable labels; skipping")
             return
 
+        real = self.data.semisupervised_labels[indexes] if hasattr(self.data, "semisupervised_labels") else None
+        n_real = int(np.sum(real != -1)) if real is not None else 0
+        n_anom = int(np.sum(labels >= 0.5))
+        n_norm = int(np.sum(labels < 0.5))
+        logger.info(f"[GRU Ch {chapter+1}] total={len(labels)} real={n_real} pseudo={len(labels)-n_real} | anom={n_anom} norm={n_norm}")
+
         agg_emb = self._collect_embeddings(indexes)
         val_emb = self._collect_val_embeddings()
 
         for _ in range(getattr(self.recurrent_model, "num_epochs", 1)):
-            self.recurrent_model.train(agg_emb, labels, epochs=1)
+            self.recurrent_model.train(agg_emb, labels, epochs=1, weights=weights)
             self._compute_recurrent_val_loss_cached(val_emb)
 
     def _mark_recurrent_started(self, chapter: int, reason: str) -> None:
