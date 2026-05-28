@@ -41,7 +41,8 @@ class SimpleCoLearner(CoLearning):
                  warmup_epochs: int = 10, max_chapters: int = 10,
                  anomaly_threshold: float = 0.5, confidence_threshold_low: float = 0.10,
                  confidence_threshold_high: float = 0.90, keep_truth: bool = True,
-                 transfer_thresholds: Optional[Dict] = None, pseudo_label_arbiter=None):
+                 transfer_thresholds: Optional[Dict] = None, pseudo_label_arbiter=None,
+                 epochs_per_chapter: int = 1):
         super().__init__(
             models,
             data,
@@ -55,12 +56,37 @@ class SimpleCoLearner(CoLearning):
             pseudo_label_arbiter=pseudo_label_arbiter,
         )
         self.keep_truth = keep_truth
+        self.epochs_per_chapter = epochs_per_chapter
         for m in models:
             m.clear_pseudo_labels()
         self.model_scores: Dict[str, np.ndarray] = {f"model_{i}": None for i in range(len(models))}
         self.ensemble_scores: Optional[np.ndarray] = None
         self.ensemble_disagreement: Optional[np.ndarray] = None
         self.exchange_history: List[Dict] = []
+
+    def _is_epoch_friendly(self, model: Model) -> bool:
+        config = getattr(model, "train_config", {}) or {}
+        default = getattr(model, "epoch_friendly", True)
+        return bool(config.get("epoch_friendly", default))
+
+    def _train_one_epoch(self, model: Model, epoch_idx: int) -> bool:
+        if epoch_idx > 0 and not self._is_epoch_friendly(model):
+            return False
+        model.train(1)
+        return True
+
+    def _train_models_for_epochs(self, epochs: int, record_val_loss: bool = False) -> None:
+        for ep in range(epochs):
+            trained = []
+            for m in self.models:
+                trained.append(self._train_one_epoch(m, ep))
+            if record_val_loss:
+                for i, m in enumerate(self.models):
+                    if not trained[i]:
+                        continue
+                    vl = _compute_val_loss(m, self.data)
+                    if vl is not None:
+                        self.val_loss_history[i].append(vl)
 
     def exchange(self) -> None:
         for m in self.models:
@@ -117,11 +143,7 @@ class SimpleCoLearner(CoLearning):
 
     def _warmup(self) -> None:
         logger.info(f"[Warmup] {len(self.models)} models x {self.warmup_epochs} epochs")
-        for ep in range(self.warmup_epochs):
-            for m in self.models:
-                m.train(1)
-            if (ep + 1) % max(1, self.warmup_epochs // 3) == 0:
-                logger.info(f"  Epoch {ep + 1}/{self.warmup_epochs}")
+        self._train_models_for_epochs(self.warmup_epochs)
 
     def _evaluate(self, y_true: np.ndarray) -> Dict[str, float]:
         scores, metrics = [], {}
@@ -144,11 +166,10 @@ class SimpleCoLearner(CoLearning):
     def cotrain(self, eval_interval: int = 1) -> Dict[str, List[float]]:
         history = {"warmup": [], "chapters": []}
         self._warmup()
-        logger.info(f"[Collab] Up to {self.max_chapters} chapters")
+        logger.info(f"[Collab] Up to {self.max_chapters} chapters ({self.epochs_per_chapter} ep/ch)")
         for ch in range(self.max_chapters):
             self.exchange()
-            for m in self.models:
-                m.train(1)
+            self._train_models_for_epochs(self.epochs_per_chapter)
             metrics = self._evaluate(self.data.y_test)
             if (ch + 1) % eval_interval == 0:
                 self._log(ch, metrics)
@@ -282,11 +303,10 @@ class RecurrentCoLearner(SimpleCoLearner):
     def cotrain(self, eval_interval: int = 1) -> Dict[str, List[float]]:
         history = {"warmup": [], "chapters": []}
         self._warmup()
-        logger.info(f"[Collab] Up to {self.max_chapters} chapters")
+        logger.info(f"[Collab] Up to {self.max_chapters} chapters ({self.epochs_per_chapter} ep/ch)")
         for ch in range(self.max_chapters):
             self.exchange()
-            for m in self.models:
-                m.train(1)
+            self._train_models_for_epochs(self.epochs_per_chapter)
             self._train_recurrent(ch)
             metrics = self._evaluate(self.data.y_test)
             if (ch + 1) % eval_interval == 0:
@@ -335,15 +355,7 @@ class DelayedRecurrentCoLearner(RecurrentCoLearner):
 
     def _warmup_with_val(self) -> None:
         logger.info(f"[Warmup] {len(self.models)} models x {self.warmup_epochs} epochs")
-        for ep in range(self.warmup_epochs):
-            for m in self.models:
-                m.train(1)
-            for i, m in enumerate(self.models):
-                vl = _compute_val_loss(m, self.data)
-                if vl is not None:
-                    self.val_loss_history[i].append(vl)
-            if (ep + 1) % max(1, self.warmup_epochs // 3) == 0:
-                logger.info(f"  Epoch {ep + 1}/{self.warmup_epochs}")
+        self._train_models_for_epochs(self.warmup_epochs, record_val_loss=True)
 
     def cotrain(self, eval_interval: int = 1) -> Dict[str, List[float]]:
         history = {"warmup": [], "chapters": []}
@@ -356,13 +368,7 @@ class DelayedRecurrentCoLearner(RecurrentCoLearner):
 
         for ch in range(self.max_chapters):
             self.exchange()
-            for _ in range(self.epochs_per_chapter):
-                for m in self.models:
-                    m.train(1)
-                for i, m in enumerate(self.models):
-                    vl = _compute_val_loss(m, self.data)
-                    if vl is not None:
-                        self.val_loss_history[i].append(vl)
+            self._train_models_for_epochs(self.epochs_per_chapter, record_val_loss=True)
 
             if ch >= self.recurrent_start_chapter:
                 self._train_recurrent(ch)
@@ -420,27 +426,13 @@ class CoLearnerVal(SimpleCoLearner):
             self.val_loss_history[i] = []
 
         logger.info(f"[Warmup] {len(self.models)} models x {self.warmup_epochs} epochs")
-        for ep in range(self.warmup_epochs):
-            for m in self.models:
-                m.train(1)
-            for i, m in enumerate(self.models):
-                vl = _compute_val_loss(m, self.data)
-                if vl is not None:
-                    self.val_loss_history[i].append(vl)
-            if (ep + 1) % max(1, self.warmup_epochs // 3) == 0:
-                logger.info(f"  Epoch {ep + 1}/{self.warmup_epochs}")
+        self._train_models_for_epochs(self.warmup_epochs, record_val_loss=True)
 
         logger.info(f"[Collab] Up to {self.max_chapters} chapters ({self.epochs_per_chapter} ep/ch)")
         for ch in range(self.max_chapters):
             self.exchange()
 
-            for _ in range(self.epochs_per_chapter):
-                for m in self.models:
-                    m.train(1)
-                for i, m in enumerate(self.models):
-                    vl = _compute_val_loss(m, self.data)
-                    if vl is not None:
-                        self.val_loss_history[i].append(vl)
+            self._train_models_for_epochs(self.epochs_per_chapter, record_val_loss=True)
 
             val_scores, metrics = [], {}
             for i, m in enumerate(self.models):
@@ -709,27 +701,13 @@ class BasicAdaptiveCoLearner(CoLearnerVal):
             self.val_loss_history[i] = []
 
         logger.info(f"[Warmup] {len(self.models)} models x {self.warmup_epochs} epochs")
-        for ep in range(self.warmup_epochs):
-            for m in self.models:
-                m.train(1)
-            for i, m in enumerate(self.models):
-                vl = _compute_val_loss(m, self.data)
-                if vl is not None:
-                    self.val_loss_history[i].append(vl)
-            if (ep + 1) % max(1, self.warmup_epochs // 3) == 0:
-                logger.info(f"  Epoch {ep + 1}/{self.warmup_epochs}")
+        self._train_models_for_epochs(self.warmup_epochs, record_val_loss=True)
 
         logger.info(f"[Collab] Up to {self.max_chapters} chapters ({self.epochs_per_chapter} ep/ch)")
         for ch in range(self.max_chapters):
             self.exchange()
 
-            for _ in range(self.epochs_per_chapter):
-                for m in self.models:
-                    m.train(1)
-                for i, m in enumerate(self.models):
-                    vl = _compute_val_loss(m, self.data)
-                    if vl is not None:
-                        self.val_loss_history[i].append(vl)
+            self._train_models_for_epochs(self.epochs_per_chapter, record_val_loss=True)
 
             val_scores, metrics = [], {}
             for i, m in enumerate(self.models):
@@ -1175,15 +1153,7 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
 
     def _warmup_with_val(self) -> None:
         logger.info(f"[Warmup] {len(self.models)} models x {self.warmup_epochs} epochs")
-        for ep in range(self.warmup_epochs):
-            for m in self.models:
-                m.train(1)
-            for i, m in enumerate(self.models):
-                vl = _compute_val_loss(m, self.data)
-                if vl is not None:
-                    self.val_loss_history[i].append(vl)
-            if (ep + 1) % max(1, self.warmup_epochs // 3) == 0:
-                logger.info(f"  Epoch {ep + 1}/{self.warmup_epochs}")
+        self._train_models_for_epochs(self.warmup_epochs, record_val_loss=True)
 
 
 # NEW evening
@@ -1255,13 +1225,7 @@ class DelayedRecurrentBasicAdaptiveCoLearner(BasicAdaptiveCoLearner):
             self.exchange()
             self._record_pseudo_context()
 
-            for _ in range(self.epochs_per_chapter):
-                for m in self.models:
-                    m.train(1)
-                for i, m in enumerate(self.models):
-                    vl = _compute_val_loss(m, self.data)
-                    if vl is not None:
-                        self.val_loss_history[i].append(vl)
+            self._train_models_for_epochs(self.epochs_per_chapter, record_val_loss=True)
 
             metrics = self._evaluate_base_models(y_val)
             self._val_ensemble_auc_history.append(metrics["ensemble"])

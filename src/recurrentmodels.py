@@ -71,7 +71,7 @@ class GRURecurrentModel(RecurrentModel):
         self._best_val_auc = -float("inf")
         self._best_state = None
         
-    def _prepare_batch(self, embeddings: np.ndarray, labels: Optional[np.ndarray] = None):
+    def _prepare_embeddings_array(self, embeddings: np.ndarray, build_if_needed: bool = True) -> np.ndarray:
         x = np.asarray(embeddings, dtype=np.float32)
         if x.ndim != 3:
             raise ValueError(f"embeddings must be 3D [n_samples, n_detectors, feature_dim], got shape {x.shape}")
@@ -80,7 +80,13 @@ class GRURecurrentModel(RecurrentModel):
                 f"expected n_detectors={self.n_detectors}, got {x.shape[1]}"
 
         if self._gru is None or self._input_size != x.shape[-1]:
+            if not build_if_needed:
+                raise ValueError(f"expected feature_dim={self._input_size}, got {x.shape[-1]}")
             self._build(x.shape[-1])
+        return x
+
+    def _prepare_batch(self, embeddings: np.ndarray, labels: Optional[np.ndarray] = None):
+        x = self._prepare_embeddings_array(embeddings)
         xt = torch.as_tensor(x, dtype=torch.float32, device=self.device)
 
         if labels is None:
@@ -214,14 +220,27 @@ class GRURecurrentModel(RecurrentModel):
     def predict_scores(self, aggregated_embeddings: np.ndarray) -> np.ndarray:
         if not self._fitted:
             raise RuntimeError("GRURecurrentModel must be fit before predict_scores()")
-        x, _, _ = self._prepare_batch(aggregated_embeddings)
+        x = self._prepare_embeddings_array(aggregated_embeddings, build_if_needed=False)
         self._gru.eval()
         self._classifier.eval()
-        with torch.no_grad():
-            return torch.sigmoid(self._forward(x)).cpu().numpy().astype(np.float32).ravel()
-    
-    
-    
+# NEW
+        scores = np.empty(x.shape[0], dtype=np.float32)
+        with torch.inference_mode():
+            for start in range(0, x.shape[0], self.batch_size):
+                end = min(start + self.batch_size, x.shape[0])
+                xb = torch.as_tensor(x[start:end], dtype=torch.float32, device=self.device)
+                scores[start:end] = torch.sigmoid(self._forward(xb)).cpu().numpy().astype(np.float32).ravel()
+        return scores
+
+        scores = np.empty(x.shape[0], dtype=np.float32)
+        with torch.inference_mode():
+            for start in range(0, x.shape[0], self.batch_size):
+                end = min(start + self.batch_size, x.shape[0])
+                xb = torch.as_tensor(x[start:end], dtype=torch.float32, device=self.device)
+                scores[start:end] = torch.sigmoid(self._forward(xb)).cpu().numpy().astype(np.float32).ravel()
+        return scores
+
+
 class LSTMRecurrentModel(GRURecurrentModel):
     """LSTM recurrent judge with the same API as GRURecurrentModel"""
 
@@ -249,9 +268,8 @@ class LSTMRecurrentModel(GRURecurrentModel):
         _, (h_n, _) = self._gru(x)
         h = h_n[-1]
         return self._classifier(h).squeeze(-1)
-    
-    
-    
+
+
 class SlidingWindowLSTMRecurrentModel(LSTMRecurrentModel):
     """LSTM judge: one continuous pass, sliding-window read, max-pool over windows"""
 
@@ -261,13 +279,13 @@ class SlidingWindowLSTMRecurrentModel(LSTMRecurrentModel):
         self.stride = stride
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self._gru(x)                                  # one continuous pass, hidden flows whole sequence
+        out, _ = self._gru(x)
         seq_len = out.size(1)
         if seq_len < self.window_size:
-            return self._classifier(out[:, -1]).squeeze(-1)    # short sequence: score final continuous state
+            return self._classifier(out[:, -1]).squeeze(-1)
         starts = range(0, seq_len - self.window_size + 1, self.stride)
-        logits = [self._classifier(out[:, s + self.window_size - 1]) for s in starts]  # window-end state, full prior context
-        return torch.stack(logits, dim=1).squeeze(-1).max(dim=1).values                # strongest window, no dilution
+        logits = [self._classifier(out[:, s + self.window_size - 1]) for s in starts]
+        return torch.stack(logits, dim=1).squeeze(-1).max(dim=1).values
 
 
 class _DeepSetsPool(nn.Module):
@@ -276,17 +294,21 @@ class _DeepSetsPool(nn.Module):
     def __init__(self, input_size: int, hidden_size: int, dropout: float = 0.0, pool: str = "attention"):
         super().__init__()
         self.pool = pool
-        self.phi = nn.Sequential(nn.Linear(input_size, hidden_size), nn.ReLU(),
-                                 nn.Dropout(dropout),
-                                 nn.Linear(hidden_size, hidden_size), nn.ReLU())
+        self.phi = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+        )
         self.attn = nn.Linear(hidden_size, 1) if pool == "attention" else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.phi(x)                                    # [B, n_detectors, H] per-detector encoding
+        h = self.phi(x)
         if self.pool == "mean":
-            return h.mean(dim=1)                           # permutation-invariant mean
-        w = torch.softmax(self.attn(h), dim=1)             # [B, n_detectors, 1] attention over detectors
-        return (w * h).sum(dim=1)                          # weighted permutation-invariant sum
+            return h.mean(dim=1)
+        w = torch.softmax(self.attn(h), dim=1)
+        return (w * h).sum(dim=1)
 
 
 class PermInvariantModel(GRURecurrentModel):
@@ -300,10 +322,12 @@ class PermInvariantModel(GRURecurrentModel):
         self._gru = _DeepSetsPool(input_size, self.hidden_size, self.dropout, self.pool).to(self.device)
         self._classifier = nn.Linear(self.hidden_size, 1).to(self.device)
         self._optimizer = torch.optim.Adam(
-            list(self._gru.parameters()) + list(self._classifier.parameters()), lr=self.lr)
+            list(self._gru.parameters()) + list(self._classifier.parameters()),
+            lr=self.lr,
+        )
         self._input_size = input_size
         self._best_val_auc = -float("inf")
         self._best_state = None
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self._classifier(self._gru(x)).squeeze(-1)  # pool over detectors then score
+        return self._classifier(self._gru(x)).squeeze(-1)
