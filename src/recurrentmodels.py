@@ -208,15 +208,6 @@ class GRURecurrentModel(RecurrentModel):
         with torch.no_grad():
             return self._criterion(self._forward(x[mask]), y[mask]).item()
 
-    # def predict_scores(self, aggregated_embeddings: np.ndarray) -> np.ndarray:
-    #     if not self._fitted:
-    #         raise RuntimeError("GRURecurrentModel must be fit before predict_scores()")
-    #     x, _, _ = self._prepare_batch(aggregated_embeddings)
-    #     self._gru.eval()
-    #     self._classifier.eval()
-    #     with torch.no_grad():
-    #         return torch.sigmoid(self._forward(x)).cpu().numpy().astype(np.float32).ravel()
-
     def predict_scores(self, aggregated_embeddings: np.ndarray) -> np.ndarray:
         if not self._fitted:
             raise RuntimeError("GRURecurrentModel must be fit before predict_scores()")
@@ -231,15 +222,6 @@ class GRURecurrentModel(RecurrentModel):
                 xb = torch.as_tensor(x[start:end], dtype=torch.float32, device=self.device)
                 scores[start:end] = torch.sigmoid(self._forward(xb)).cpu().numpy().astype(np.float32).ravel()
         return scores
-
-        scores = np.empty(x.shape[0], dtype=np.float32)
-        with torch.inference_mode():
-            for start in range(0, x.shape[0], self.batch_size):
-                end = min(start + self.batch_size, x.shape[0])
-                xb = torch.as_tensor(x[start:end], dtype=torch.float32, device=self.device)
-                scores[start:end] = torch.sigmoid(self._forward(xb)).cpu().numpy().astype(np.float32).ravel()
-        return scores
-
 
 class LSTMRecurrentModel(GRURecurrentModel):
     """LSTM recurrent judge with the same API as GRURecurrentModel"""
