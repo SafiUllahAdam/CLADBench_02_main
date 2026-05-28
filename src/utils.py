@@ -20,15 +20,65 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def create_models(registry: Dict[str, type], model_names: List[str], data: Data) -> List[Model]:
+class FeatureView:
+    """Read-only Data proxy exposing a fixed feature subset; labels and indices stay shared"""
+
+    def __init__(self, data: Data, cols: np.ndarray):
+        self._data = data
+        self._cols = np.asarray(cols)
+        self.X_train = None if getattr(data, "X_train", None) is None else data.X_train[:, self._cols]
+        self.X_val = None if getattr(data, "X_val", None) is None else data.X_val[:, self._cols]
+        self.X_test = None if getattr(data, "X_test", None) is None else data.X_test[:, self._cols]
+
+    def __getattr__(self, name):
+        if name in ("_data", "_cols"):
+            raise AttributeError(name)
+        return getattr(self._data, name)
+
+
+def _feature_importance(data: Data) -> np.ndarray:
+    """Rank feature indices high-to-low by univariate val signal (f_classif); variance fallback"""
+    X, y = getattr(data, "X_val", None), getattr(data, "y_val", None)
+    if X is None or y is None or len(np.unique(y)) < 2:
+        return np.argsort(-np.var(getattr(data, "X_train"), axis=0))
+    from sklearn.feature_selection import f_classif
+    F, _ = f_classif(X, np.asarray(y))
+    return np.argsort(-np.nan_to_num(F, nan=0.0))
+
+
+def feature_views(data: Data, n: int, ratio: float = 0.75, protect_frac: float = 0.5,
+                  min_features: int = 2, seed: int = 0) -> List[FeatureView]:
+    """Build n views that always keep the top-signal features and randomize the redundant tail"""
+    X = getattr(data, "X_train", None)
+    if X is None:
+        raise ValueError("feature_views needs data.X_train")
+    d = X.shape[1]
+    k = min(d, max(min_features, int(round(d * ratio))))
+    order = _feature_importance(data)
+    p = min(k, max(0, int(round(d * protect_frac))))
+    protected, tail = order[:p], order[p:]
+    rng = np.random.RandomState(seed)
+    views = []
+    for _ in range(n):
+        extra = rng.choice(tail, size=k - p, replace=False) if k - p > 0 and len(tail) else np.array([], dtype=int)
+        views.append(FeatureView(data, np.sort(np.concatenate([protected, extra]).astype(int))))
+    return views
+
+
+def create_models(registry: Dict[str, type], model_names: List[str], data: Data,
+                  view_ratio: Optional[float] = None, protect_frac: float = 0.5,
+                  view_seed: int = 0) -> List[Model]:
+    views = (feature_views(data, len(model_names), ratio=view_ratio, protect_frac=protect_frac, seed=view_seed)
+             if view_ratio is not None and view_ratio < 1.0 else None)
     models = []
-    for name in model_names:
+    for i, name in enumerate(model_names):
         if name not in registry:
             raise KeyError(f"Model '{name}' not in registry. Available: {list(registry.keys())}")
         try:
-            m = registry[name](train_config=get_model_config(name), model_config={}, data=data)
+            m = registry[name](train_config=get_model_config(name), model_config={},
+                               data=views[i] if views is not None else data)
             models.append(m)
-            logger.info(f"Created model: {name}")
+            logger.info(f"Created model: {name}" + (f" (feature view {len(views[i]._cols)}/{data.X_train.shape[1]})" if views else ""))
         except Exception as e:
             raise ValueError(f"Failed to create '{name}': {e}") from e
     logger.info(f"Created {len(models)} models: {model_names}")
