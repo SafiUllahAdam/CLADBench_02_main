@@ -49,16 +49,6 @@ class GRURecurrentModel(RecurrentModel):
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
 
-    # def _build(self, input_size: int) -> None:
-    #     self._gru = nn.GRU(input_size=input_size, hidden_size=self.hidden_size,
-    #                        num_layers=self.num_layers,
-    #                        dropout=self.dropout if self.num_layers > 1 else 0.0,
-    #                        batch_first=True, bidirectional=True).to(self.device)
-    #     self._classifier = nn.Linear(self.hidden_size * 2, 1).to(self.device)
-    #     self._optimizer = torch.optim.Adam(
-    #         list(self._gru.parameters()) + list(self._classifier.parameters()), lr=self.lr)
-    #     self._input_size = input_size
-
     def _build(self, input_size: int) -> None:
         self._gru = nn.GRU(input_size=input_size, hidden_size=self.hidden_size,
                            num_layers=self.num_layers,
@@ -214,7 +204,7 @@ class GRURecurrentModel(RecurrentModel):
         x = self._prepare_embeddings_array(aggregated_embeddings, build_if_needed=False)
         self._gru.eval()
         self._classifier.eval()
-# NEW
+
         scores = np.empty(x.shape[0], dtype=np.float32)
         with torch.inference_mode():
             for start in range(0, x.shape[0], self.batch_size):
@@ -294,7 +284,7 @@ class _DeepSetsPool(nn.Module):
 
 
 class PermInvariantModel(GRURecurrentModel):
-    """Permutation-invariant judge: per-detector MLP + mean/attention pooling (DeepSets)"""
+    """Permutation-invariant judge: per-detector MLP + attention pooling (DeepSets)"""  # We used attention pooling, it shows better judge results than mean pooling in our experiments.
 
     def __init__(self, *args, pool: str = "attention", **kwargs):
         super().__init__(*args, **kwargs)
